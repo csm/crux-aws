@@ -63,10 +63,10 @@
                                                      :ReceiptHandle (:ReceiptHandle message))}))))))))))
 
 (defn start-event-log-consumer
-  ^java.io.Closeable
-  [indexer event-log-consumer region sqs-queue]
+  ^Closeable
+  [indexer event-log-consumer region sqs-queue & {:keys [sqs-client]}]
   (let [running? (atom true)
-        sqs-client (aws/client {:api :sqs :region region})
+        sqs-client (or sqs-client (aws/client {:api :sqs :region region}))
         worker-thread (doto (Thread. #(try
                                         (sqs-polling-consumer running? indexer event-log-consumer sqs-client sqs-queue)
                                         (catch Throwable t

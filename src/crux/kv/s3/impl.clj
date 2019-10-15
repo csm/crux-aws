@@ -11,6 +11,13 @@
            [org.agrona ExpandableDirectByteBuffer]
            [org.agrona.io DirectBufferInputStream]))
 
+(def ^:dynamic *debug* false)
+
+(defmacro debug
+  [& args]
+  `(when *debug*
+     (log/debug ~@args)))
+
 ; hex converters until crux cuts a release with https://github.com/juxt/crux/commit/b06335ffd3c717839b3ccfcabe36d18792c50df2
 (let [hex->nibble (into {} (map (fn [i] [(.charAt (format "%x" i) 0) i]) (range 0x10)))]
   (defn hex->buffer
@@ -90,6 +97,7 @@
           args (if (some? version-marker) (assoc args :VersionIdMarker version-marker) args)
           result (aws/invoke client {:op :ListObjectVersions
                                      :request (assoc args :MaxKeys *page-size*)})]
+      (debug :task ::s3kv-iterator-read-page :phase :list-versions-result :result result)
       (if (s/valid? ::anomalies/anomaly result)
         (throw (ex-info "failed to read object versions" {:error result}))
         (let [result (dissoc
@@ -107,10 +115,10 @@
   [{:keys [state snapshot]}]
   (let [{:keys [client bucket timestamp]} snapshot
         {:keys [page index]} @state]
-    (log/debug :task ::s3kv-iterator-page-forward
-               :page (update page :FilteredKeys #(map :Key %))
-               :index index
-               :phase :begin)
+    (debug :task ::s3kv-iterator-page-forward
+           :page (update page :FilteredKeys #(map :Key %))
+           :index index
+           :phase :begin)
     (if (or (nil? index)
             (:IsTruncated page))
       (let [next-page (s3kv-iterator-read-page client timestamp
@@ -136,14 +144,14 @@
   [{:keys [state snapshot] :as this} prev-state k]
   (let [{:keys [page index]} @state
         {:keys [client bucket timestamp]} snapshot]
-    (log/debug :task ::s3kv-iterator-seek
-               :k k
-               :phase :begin)
+    (debug :task ::s3kv-iterator-seek
+           :k k
+           :phase :begin)
     (if (nil? index)
       (do (s3kv-iterator-page-forward this)
           (recur this nil k))
       (let [found (Collections/binarySearch (map :Key (:FilteredKeys page)) k)]
-        (log/debug :task ::s3kv-iterator-seek :found found :phase :probed-current-page)
+        (debug :task ::s3kv-iterator-seek :found found :phase :probed-current-page)
         (if (neg? found)
           (cond
             ; key is in a page before the current page
@@ -191,7 +199,7 @@
 (defn s3kv-iterator-next
   [{:keys [state] :as this}]
   (let [{:keys [index page end]} @state]
-    (log/debug :task ::s3kv-iterator-next :index index :phase :begin)
+    (debug :task ::s3kv-iterator-next :index index :phase :begin)
     (cond
       end
       nil
@@ -212,17 +220,22 @@
   [{:keys [state snapshot]}]
   (let [{:keys [index page]} @state
         {:keys [client bucket timestamp]} snapshot]
-    (log/debug :task ::s3kv-iterator-prev :index index :phase :begin)
+    (debug :task ::s3kv-iterator-prev :index index :phase :begin)
     (if (zero? index)
       ; roll back to the start, scan until we are on page before (or containing) current key
       (let [first-key (:Key (first (:FilteredKeys page)))
             first-page (s3kv-iterator-read-page client timestamp {:Bucket bucket})]
-        (log/debug :task ::s3kv-iterator-prev :first-key first-key :first-page (map :Key (:FilteredKeys first-page))
-                   :phase :rewound-to-start)
+        (debug :task ::s3kv-iterator-prev
+               :first-key first-key
+               :first-page (map :Key (:FilteredKeys first-page))
+               :phase :rewound-to-start)
         (loop [prev-page first-page]
           (let [found (Collections/binarySearch (map :Key (:FilteredKeys prev-page)) first-key)]
-            (log/debug :task ::s3kv-iterator-prev :first-key first-key :prev-page (map :Key (:FilteredKeys prev-page))
-                       :found found :phase :starting-loop)
+            (debug :task ::s3kv-iterator-prev
+                   :first-key first-key
+                   :prev-page (map :Key (:FilteredKeys prev-page))
+                   :found found
+                   :phase :starting-loop)
             (cond
               (or (= -1 found) (zero? found))
               (if (identical? first-page prev-page)
@@ -272,7 +285,7 @@
   [{:keys [state snapshot]}]
   (let [{:keys [index page]} @state
         {:keys [client bucket]} snapshot]
-    (log/debug :task ::s3kv-iterator-value :index index :phase :begin)
+    (debug :task ::s3kv-iterator-value :index index :phase :begin)
     (when (and (some? index)
                (< index (count (:FilteredKeys page))))
       (let [target (nth (:FilteredKeys page) index)
@@ -290,14 +303,14 @@
 
 (defn s3kv-snapshot-new-iterator
   [{:keys [client bucket timestamp] :as this}]
-  (log/debug :task ::s3kv-snapshot-new-iterator :this this :phase :begin)
+  (debug :task ::s3kv-snapshot-new-iterator :this this :phase :begin)
   (let [state (atom {})
         ctor (resolve 'crux.kv.s3/->S3KvIterator)]
     (ctor state this)))
 
 (defn s3kv-snapshot-get-value
   [{:keys [client bucket timestamp] :as this} k]
-  (log/debug :task ::s3kv-snapshot-get-value :this this :k k :phase :begin)
+  (debug :task ::s3kv-snapshot-get-value :this this :k k :phase :begin)
   (let [k (buffer->hex (mem/as-buffer k))
         version (->> (versions-seq client bucket {:Prefix k})
                      (filter #(= k (:Key %)))
@@ -318,21 +331,22 @@
 
 (defn s3kv-open
   [this options]
-  (log/debug :task ::s3kv-open :options options :phase :begin)
-  (let [client (aws/client (assoc options :api :s3))
+  (debug :task ::s3kv-open :options options :phase :begin)
+  (let [client (or (get options :crux.aws/s3-client)
+                   (aws/client (assoc options :api :s3)))
         result (assoc this :client client
                            :bucket (:bucket options (:db-dir options)))]
     result))
 
 (defn s3kv-new-snapshot
   [{:keys [client bucket]}]
-  (log/debug :task ::s3kv-new-snapshot :phase :begin)
+  (debug :task ::s3kv-new-snapshot :phase :begin)
   (let [ctor (resolve 'crux.kv.s3/->S3KvSnapshot)
         timestamp (Date.)]
     (ctor client bucket timestamp)))
 
 (defn s3kv-store [{:keys [client bucket]} kvs]
-  (log/debug :task ::s3kv-store :kvs kvs :phase :begin)
+  (debug :task ::s3kv-store :kvs kvs :phase :begin)
   (doseq [[k v] kvs]
     (let [k (buffer->hex (mem/as-buffer k))
           v (mem/as-buffer v)
@@ -340,12 +354,12 @@
                                        :request {:Bucket bucket
                                                  :Key    k
                                                  :Body   (DirectBufferInputStream. v)}})]
-      (log/debug :task ::s3kv-store :k k :v v :result response)
+      (debug :task ::s3kv-store :k k :v v :result response)
       (when (s/valid? ::anomalies/anomaly response)
         (throw (ex-info "storing object failed" {:error response}))))))
 
 (defn s3kv-delete [{:keys [client bucket]} ks]
-  (log/debug :task ::s3kv-delete :ks ks :phase :begin)
+  (debug :task ::s3kv-delete :ks ks :phase :begin)
   (doseq [k ks]
     (let [response (aws/invoke client {:op      :DeleteObject
                                        :request {:Bucket bucket
@@ -354,7 +368,7 @@
         (throw (ex-info "deleting object failed" {:error response}))))))
 
 (defn s3kv-count-keys [{:keys [client bucket]}]
-  (log/debug :task ::s3kv-count-keys :phase :begin)
+  (debug :task ::s3kv-count-keys :phase :begin)
   (loop [token nil
          cnt 0]
     (let [response (aws/invoke client {:op      :ListObjectsV2
