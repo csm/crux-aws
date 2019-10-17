@@ -1,4 +1,5 @@
 (ns crux.kv.s3
+  "Deprecated; don't use this. This idea didn't pan out."
   (:require [crux.kv :as kv]
             [crux.kv.s3.impl :refer :all]
             [cognitect.aws.client.api :as aws])

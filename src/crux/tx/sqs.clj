@@ -24,6 +24,7 @@
         (let [idle? (with-open [context (consumer/new-event-log-context event-log-consumer)]
                       (let [next-offset (get-in (db/read-index-meta indexer :crux.tx-log/consumer-state) [:crux.tx/event-log :next-offset])]
                         (if-let [^Message last-message (reduce (fn [last-message ^Message m]
+                                                                 (log/debug "message:" m)
                                                                  (case (get (.headers m) :crux.tx/sub-topic)
                                                                    :docs
                                                                    (db/index-doc indexer (.key m) (.body m))
@@ -31,7 +32,8 @@
                                                                    (db/index-tx indexer
                                                                                 (.body m)
                                                                                 (.message-time m)
-                                                                                (.message-id m)))
+                                                                                (.message-id m))
+                                                                   nil)
                                                                  m)
                                                                nil
                                                                (consumer/next-events event-log-consumer context next-offset))]
@@ -46,7 +48,7 @@
                                                  :time (.message-time last-message)}}]
                             (log/debug "Event log consumer state:" (pr-str consumer-state))
                             (db/store-index-meta indexer :crux.tx-log/consumer-state consumer-state)
-                            false)
+                            (zero? lag))
                           true)))]
           (when idle?
             (log/debug :task ::sqs-polling-consumer :phase :polling-sqs :queue queue-url)
