@@ -11,7 +11,8 @@
             [crux.tx.sqs :as tx-sqs]
             [crux.codec :as c]
             [taoensso.nippy :as nippy]
-            [clojure.tools.logging :as log])
+            [clojure.tools.logging :as log]
+            [crux.index :as idx])
   (:import [java.util Date Base64]
            [java.io Closeable]
            [com.google.common.io ByteStreams]
@@ -125,7 +126,7 @@
   db/TxLog
   (submit-doc [_ content-hash doc]
     (let [id (str content-hash)]
-      (if (tx/evicted-doc? doc)
+      (if (idx/evicted-doc? doc)
         (evict-docs! s3-client bucket cache id)
         (insert-event! s3-client bucket ddb-client table-name cache id doc "docs"))))
 
