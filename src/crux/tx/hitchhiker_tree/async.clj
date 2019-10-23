@@ -3,5 +3,4 @@
 
 ; is this nonsense actually necessary?
 
-(binding [hitchhiker.tree.async/*async-backend* :core.async]
-  (require 'hitchhiker.tree.core))
+(alter-var-root #'hitchhiker.tree.async/*async-backend* (constantly :core.async))
