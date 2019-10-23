@@ -248,6 +248,7 @@
                             :last-txlog-id (-> item :last-txlog-id :S)})
             root (hh/<? (hhs3/create-tree-from-root-key (:s3-bucket backend)
                                                         (:bucket backend)
+                                                        (:cache backend)
                                                         (:root-address metadata)))]
         (swap! state assoc :metadata metadata :root root))))
 
