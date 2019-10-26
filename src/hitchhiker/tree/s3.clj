@@ -30,19 +30,19 @@
   (dirty? [_] false)
   (last-key [_] last-key)
   (resolve [_]
-    (core/go-try
-      (if-let [value (cache/lookup @(:cache context) guid)]
-        (do
-          (swap! (:cache context) cache/hit guid)
-          (assoc value :storage-addr (doto (async/promise-chan) (async/put! guid))))
-        (let [result (async/<! (aws/invoke (:s3-client context) {:op :GetObject
-                                                                 :request {:Bucket (:bucket context)
-                                                                           :Key (str guid)}}))]
-          (cond (s/valid? ::anomalies/anomaly result)
-                (ex-info "failed to get value from S3" {:error result})
+    (binding [*context* context]
+      (core/go-try
+        (if-let [value (cache/lookup @(:cache context) guid)]
+          (do
+            (swap! (:cache context) cache/hit guid)
+            (assoc value :storage-addr (doto (async/promise-chan) (async/put! guid))))
+          (let [result (async/<! (aws/invoke (:s3-client context) {:op :GetObject
+                                                                   :request {:Bucket (:bucket context)
+                                                                             :Key (str guid)}}))]
+            (cond (s/valid? ::anomalies/anomaly result)
+                  (ex-info "failed to get value from S3" {:error result})
 
-                :else
-                (binding [*context* context]
+                  :else
                   (let [value (nippy/thaw (ByteStreams/toByteArray (:Body result)))]
                     (swap! (:cache context) cache/miss guid value)
                     (assoc value :storage-addr (doto (async/promise-chan) (async/put! guid)))))))))))
@@ -118,7 +118,7 @@
                      :last-key last-key})))
 
 (defn create-tree-from-root-key
-  [s3-client bucket cache root-key]
+  [backend root-key]
   (core/go-try
-    (let [address (->S3Address {:s3-client s3-client :bucket bucket :cache cache} root-key nil)]
+    (let [address (->S3Address backend root-key nil)]
       (core/<? (core/resolve address)))))

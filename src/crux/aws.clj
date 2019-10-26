@@ -1,14 +1,23 @@
 (ns crux.aws
-  (:require [crux.bootstrap :as b]
-            [crux.tx.s3 :as s3])
+  (:require [crux.tx.s3 :as s3]
+            [crux.tx.hitchhiker-tree :as crux-hh]
+            [crux.node :as n])
   (:import [crux.api ICruxAPI]))
 
-(defn start-aws-node
+(comment ; todo rewrite for new DI stuff
+  (defn start-aws-node
+    ^ICruxAPI [config]
+    (let [config (if (nil? (:kv-backend config))
+                   (assoc config :kv-backend "crux.kv.rocksdb.RocksKv")
+                   config)]
+      (b/start-node s3/node-config config))))
+
+(defn start-hh-node
   ^ICruxAPI [config]
   (let [config (if (nil? (:kv-backend config))
                  (assoc config :kv-backend "crux.kv.rocksdb.RocksKv")
                  config)]
-    (b/start-node s3/node-config config)))
+    (n/start (assoc config :crux.node/topology crux-hh/topology))))
 
 (comment
   "You'll want an S3 bucket, DynamoDB table, and SQS queue.
