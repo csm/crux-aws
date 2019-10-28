@@ -25,7 +25,8 @@
            [java.time ZonedDateTime ZoneOffset]
            [java.time.format DateTimeFormatter]
            [java.util Date UUID]
-           [com.google.common.io ByteStreams]))
+           [com.google.common.io ByteStreams]
+           [crux.tx.consumer Message]))
 
 ; Ideas:
 ; Write a tx log to dynamodb, after it gets to a certain size, flush
@@ -129,24 +130,93 @@
     (.putLong buf (.nextLong random))
     (b64/b64-encode bytes)))
 
-(defn insert-doc! [ddb-client table-name id doc topic]
+; TODO I can't really get any better than doing an atomic
+; increment on a row in dynamodb. It would be nice if we could
+;
+
+(defn generate-tx-ids
+  "Generate n transaction IDs, atomically updating the dynamodb
+  table with the new, latest tx-ids."
+  [ddb-client table-name n]
+  (async/go-loop [delay 500]
+    (let [get-item (async/<! (aws-async/invoke ddb-client {:op :GetItem
+                                                           :request {:TableName table-name
+                                                                     :Key {"topic" {:S "metadata"}
+                                                                           "id" {:S "tx-id"}}
+                                                                     :ConsistentRead true}}))]
+      (cond (and (s/valid? ::anomalies/anomaly get-item)
+                 (some? (:__type get-item))
+                 (string/includes? (:__type get-item) "ProvisionedThroughputExceeded"))
+            (do (async/<! (async/timeout delay))
+                (recur (min 60000 (* delay 2))))
+
+            (s/valid? ::anomalies/anomaly get-item)
+            (ex-info "failed to read tx-id" {:error get-item})
+
+            :else
+            (let [last-txid (some-> get-item :Item :txid :N (Long/parseLong))
+                  result (async/<! (if (some? last-txid)
+                                     (aws-async/invoke ddb-client {:op :UpdateItem
+                                                                   :request {:TableName table-name
+                                                                             :Key {"topic" {:S "metadata"}
+                                                                                   "id" {:S "tx-id"}}
+                                                                             :UpdateExpression "SET #txid = #txid + :num"
+                                                                             :ConditionExpression "#txid = :lastTxid"
+                                                                             :ExpressionAttributeNames {"#txid" "txid"}
+                                                                             :ExpressionAttributeValues {":num" {:N (str n)}
+                                                                                                         ":lastTxid" {:N (str last-txid)}}}})
+                                     (aws-async/invoke ddb-client {:op :PutItem
+                                                                   :request {:TableName table-name
+                                                                             :Item {"topic" {:S "metadata"}
+                                                                                    "id" {:S "tx-id"}
+                                                                                    "txid" {:N (str n)}}
+                                                                             :ConditionExpression "attribute_not_exists(topic) AND attribute_not_exists(id)"}})))]
+              (if (s/valid? ::anomalies/anomaly result)
+                (cond
+                  (= "The conditional request failed" (:message result))
+                  (recur 500)
+
+                  (and (some? (:__type result))
+                       (string/includes? (:__type result) "ProvisionedThroughputExceeded"))
+                  (do (async/<! (async/timeout delay))
+                      (recur (min 60000 (* 2 delay))))
+
+                  :else
+                  (ex-info "failed to update txid" {:error result}))
+                (range (or last-txid 0) (+ (or last-txid 0) n))))))))
+
+(defn encode-tx-id
+  [id]
+  (let [b (byte-array 8)
+        buf (ByteBuffer/wrap b)]
+    (.putLong buf id)
+    (b64/b64-encode b)))
+
+(defn decode-tx-id
+  [s]
+  (let [b (b64/b64-decode s)
+        buf (ByteBuffer/wrap b)]
+    (.getLong buf)))
+
+(defn insert-doc! [ddb-client table-name tx-id id doc topic]
   (let [encoded-doc (nippy/freeze doc)
-        tx-id (->tx-id)
+        encoded-tx-id (encode-tx-id tx-id)
         tx-date (ZonedDateTime/now ZoneOffset/UTC)
         item (as-> {"topic"     {:S "tx-log"}
-                    "id"        {:S tx-id}
+                    "id"        {:S encoded-tx-id}
                     "tx-date"   {:S (.format tx-date DateTimeFormatter/ISO_OFFSET_DATE_TIME)}
                     "tx-data"   {:B encoded-doc}
                     "sub-topic" {:S (str topic)}
                     "op"        {:S "insert"}} item
                    (if (some? id) (assoc item "doc-id" {:S id}) item))]
+    (log/debug :task ::insert-doc! :phase :inserting :item item)
     (loop [delay 1000]
       (let [result (aws/invoke ddb-client {:op      :PutItem
                                            :request {:TableName table-name
                                                      :Item item}})]
         (cond (and (s/valid? ::anomalies/anomaly result)
                    (some? (:__type result))
-                   (string/includes? (:__type result) "ProvisionedThrougputExceeded"))
+                   (string/includes? (:__type result) "ProvisionedThroughputExceeded"))
               (do
                 (Thread/sleep delay)
                 (recur (min 60000 (* 2 delay))))
@@ -162,7 +232,7 @@
 
 (defn evict-doc!
   [ddb-client table-name id]
-  "todo, how to evict?")
+  (log/warn "TODO doc eviction"))
 
 (defprotocol ITxLogReload
   (reload! [this]
@@ -180,66 +250,46 @@
 
     Returns a promise channel that yields a value when complete."))
 
+(defrecord HitchhikerTreeTxLogConsumerContext [tree]
+  Closeable
+  (close [_]))
+
+(defn possibly-flush-txlog
+  [tx-log last-tx-id]
+  (let [last-tree-id (hh/last-key (-> tx-log :state deref :root))]
+    (when (> (- last-tx-id (or last-tree-id 0)) 1024)
+      (log/debug :task ::possibly-flush-txlog :phase :flushing-now :last-tx-id last-tx-id :last-tree-id last-tree-id)
+      (hh/<?? (write-back! tx-log)))))
+
 (defrecord HitchhikerTreeTxLog [node-id state backend ddb-client table-name]
   db/TxLog
-  (submit-doc [_ content-hash doc]
-    (if (idx/evicted-doc? doc)
-      (evict-doc! ddb-client table-name (str content-hash))
-      (insert-doc! ddb-client table-name (str content-hash) doc "docs")))
+  (submit-doc [this content-hash doc]
+    (let [tx-id (first (hh/<?? (generate-tx-ids ddb-client table-name 1)))]
+      (if (idx/evicted-doc? doc)
+        (evict-doc! ddb-client table-name (str content-hash))
+        (insert-doc! ddb-client table-name tx-id (str content-hash) doc "docs"))
+      (possibly-flush-txlog this tx-id)))
 
   (submit-tx [this tx-ops]
-    (doseq [doc (tx/tx-ops->docs tx-ops)]
-      (db/submit-doc this (str (c/new-id doc)) doc))
-    (let [tx-events (tx/tx-ops->tx-events tx-ops)
-          tx (insert-doc! ddb-client table-name nil tx-events "txs")]
-      (delay {:crux.tx/tx-id   (:index tx)
-              :crux.tx/tx-time (:date tx)})))
+    (let [docs (tx/tx-ops->docs tx-ops)
+          tx-ids (hh/<?? (generate-tx-ids ddb-client table-name (inc (count docs))))]
+      (doseq [[doc tx-id] (map vector docs (butlast tx-ids))]
+        (insert-doc! ddb-client table-name tx-id (str (c/new-id doc)) doc "docs"))
+      (let [tx-events (tx/tx-ops->tx-events tx-ops)
+            tx (insert-doc! ddb-client table-name (last tx-ids) nil tx-events "txs")]
+        (possibly-flush-txlog this (last tx-ids))
+        (delay {:crux.tx/tx-id   (:index tx)
+                :crux.tx/tx-time (:date tx)}))))
 
   (new-tx-log-context [_]
-    (->HitchhikerTreeTxLogContext (atom nil) (:root @state)))
+    (->HitchhikerTreeTxLogConsumerContext (:root @state)))
 
-  (tx-log [_ context from-tx-id]
-    (open! context from-tx-id)
-    ((fn step [prev-tx-id prev-txlog-id]
+  (tx-log [this context from-tx-id]
+    ((fn step [from-tx-id]
        (lazy-seq
-         (if-let [x (async/alt!! @(:chan context)     ([v] v)
-                                 (async/timeout 5000) ::timeout)]
-           (cond
-             (instance? Throwable x)
-             (throw x)
-
-             (not= ::timeout x)
-             (cons (val x) (step (.-key (val x)) nil)))
-           (let [txlog-id (or prev-txlog-id (-> @state :metadata :last-txlog-id) "00--")
-                 result (aws/invoke ddb-client {:op :Scan
-                                                :request {:TableName table-name
-                                                          :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}]
-                                                                                :ComparisonOperator "EQ"}}
-                                                          :ExclusiveStartKey {"topic" {:S "tx-log"}
-                                                                              "id" {:S txlog-id}}
-                                                          :Limit 1}})]
-             ; todo there are better ways to handle this, avoid a network call per item.
-             (cond (s/valid? ::anomalies/anomaly result) ; todo handle throttles here
-                   (throw (ex-info "failed to scan tx-log" {:error result}))
-
-                   (empty? (:Items result))
-                   nil
-
-                   :else
-                   (let [body (nippy/thaw (-> result :Items first :tx-data :B (ByteStreams/toByteArray)))
-                         tx-date (-> result :Items first :tx-date :S
-                                      (ZonedDateTime/parse (DateTimeFormatter/ISO_OFFSET_DATE_TIME))
-                                      (.toInstant)
-                                      (.toEpochMilli)
-                                      (Date.))]
-                     (cons (consumer/->Message body
-                                               nil
-                                               (inc (or prev-tx-id -1))
-                                               tx-date
-                                               (-> result :Items first :doc-id :S)
-                                               {::tx/sub-topic (-> result :Items first :sub-topic :S keyword)})
-                           (step (inc (or prev-tx-id -1)) (-> result :Items first :id :S)))))))))
-     nil nil))
+         (when-let [batch (not-empty (consumer/next-events this context from-tx-id))]
+           (concat batch (step (.-message-id (last batch)))))))
+     from-tx-id))
 
   ITxLogReload
   (reload! [_]
@@ -409,81 +459,83 @@
                                                                                                          ":lastTxId" {:S partial-results}}}}))))
                           :committing-metadata
                           (when (s/valid? ::anomalies/anomaly result)
-                            (throw (ex-info "failed to commit tree metadata" {:error result}))))))))))))))))
+                            (throw (ex-info "failed to commit tree metadata" {:error result})))))))))))))))
 
-(defrecord HitchhikerTreeTxLogConsumerContext [tree]
-  Closeable
-  (close [_]))
-
-(defrecord HitchhikerTreeTxLogConsumer [tx-log]
   consumer/PolledEventLog
-  (new-event-log-context [this]
-    (log/debug :task ::consumer/new-event-log-context :phase :begin
-               :tx-log tx-log)
-    (->HitchhikerTreeTxLogConsumerContext (-> tx-log :state deref :root)))
+  (new-event-log-context [_]
+    (->HitchhikerTreeTxLogConsumerContext (:root @state)))
 
   (next-events [_ context next-offset]
-    (let [path (hh/<?? (hh/lookup-path (:tree context) next-offset))
-          events (loop [path path
-                        items []]
-                   (if (and path (< (count items) 1024))
-                     (let [start-node (peek path)
-                           _ (assert (hh/data-node? start-node))
-                           elements (-> start-node
-                                        :children
-                                        (subseq >= next-offset))]
-                       (recur (hh/<?? (hh/right-successor (pop path)))
-                              (into items (take (- 100 (count items))
-                                                (map val elements)))))
-                     items))
-          last-txid (or (some-> events last (.-key)) -1)
+    (log/debug :task ::consumer/next-events :phase :begin
+               :next-offset next-offset)
+    (let [last-key (or (hh/last-key (:tree context)) -1)
+          path (hh/<?? (hh/lookup-path (:tree context) next-offset))
+          events (if (<= next-offset last-key)
+                   (loop [path path
+                          items []]
+                     (if (and path (< (count items) 1024))
+                       (let [start-node (peek path)
+                             _ (assert (hh/data-node? start-node))
+                             elements (-> start-node
+                                          :children
+                                          (subseq >= next-offset))]
+                         (recur (hh/<?? (hh/right-successor (pop path)))
+                                (into items (take (- 1024 (count items))
+                                                  (map val elements)))))
+                       items))
+                   [])
           remaining (when (< (count events) 1024)
-                      (let [txlog-key (or (-> tx-log :state deref :metadata :last-txlog-id) "00--")
-                            result (aws/invoke (:ddb-client tx-log) {:op :Scan
-                                                                     :request {:TableName (:table-name tx-log)
-                                                                               :ExclusiveStartKey {"topic" {:S "tx-log"}
-                                                                                                   "id" {:S txlog-key}}
-                                                                               :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}]
-                                                                                                     :ComparisonOperator "EQ"}}}})]
+                      (let [next-offset (+ next-offset (count events))
+                            txlog-key (if (pos? next-offset)
+                                        (encode-tx-id (dec next-offset))
+                                        "0")
+                            result (aws/invoke ddb-client {:op :Scan
+                                                           :request {:TableName table-name
+                                                                     :ExclusiveStartKey {"topic" {:S "tx-log"}
+                                                                                         "id" {:S txlog-key}}
+                                                                     :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}]
+                                                                                           :ComparisonOperator "EQ"}}}})]
+                        (log/debug :task ::consumer/next-events :phase :scanned-ddb :result result)
                         (cond (s/valid? ::anomalies/anomaly result) ; todo handle throttles
                               (throw (ex-info "failed to scan tx-log" {:error result}))
 
                               :else
                               (->> (:Items result)
-                                   (map-indexed (fn [i {:keys [tx-date tx-data sub-topic doc-id]}]
-                                                  (consumer/->Message (nippy/thaw (ByteStreams/toByteArray (:B tx-data)))
-                                                                      nil
-                                                                      (+ i last-txid)
-                                                                      (-> (:S tx-date)
-                                                                          (ZonedDateTime/parse DateTimeFormatter/ISO_OFFSET_DATE_TIME)
-                                                                          (.toInstant)
-                                                                          (.toEpochMilli)
-                                                                          (Date.))
-                                                                      (:S doc-id)
-                                                                      {::tx/sub-topic (some-> (:S sub-topic) keyword)})))))))]
+                                   (map (fn [{:keys [id tx-date tx-data sub-topic doc-id]}]
+                                          (consumer/->Message (nippy/thaw (ByteStreams/toByteArray (:B tx-data)))
+                                                              nil
+                                                              (decode-tx-id (:S id))
+                                                              (-> (:S tx-date)
+                                                                  (ZonedDateTime/parse DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+                                                                  (.toInstant)
+                                                                  (.toEpochMilli)
+                                                                  (Date.))
+                                                              (:S doc-id)
+                                                              {::tx/sub-topic (some-> (:S sub-topic) keyword)})))))))]
       (into events remaining)))
 
   (end-offset [_]
-    (let [tree-key (hh/last-key (-> tx-log :state deref :root))]
-      (loop [ddb-delay 1000]
-        (let [txlog-key (or (-> tx-log :state deref :metadata :last-txlog-id) "00--")
-              scan-result (aws/invoke (:ddb-client tx-log) {:op :Scan
-                                                            :request {:TableName (:table-name tx-log)
-                                                                      :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}] :ComparisonOperator "EQ"}}
-                                                                      :Select "COUNT"
-                                                                      :ExclusiveStartKey {"topic" {:S "tx-log"}
-                                                                                          "id" {:S txlog-key}}}})]
-          (cond (and (s/valid? ::anomalies/anomaly scan-result)
-                     (some? (:__type scan-result))
-                     (string/includes? (:__type scan-result) "ProvisionedThroughputExceeded"))
-                (do (Thread/sleep ddb-delay)
-                    (recur (min 60000 (* ddb-delay 2))))
+    (loop [delay 500]
+      (let [query-result (aws/invoke ddb-client {:op :Query
+                                                 :request {:TableName table-name
+                                                           :KeyConditionExpression "#topic = :topic"
+                                                           :ExpressionAttributeNames {"#topic" "topic"}
+                                                           :ExpressionAttributeValues {":topic" {:S "tx-log"}}
+                                                           :ScanIndexForward false
+                                                           :Limit 1}})]
+        (cond (and (s/valid? ::anomalies/anomaly query-result)
+                   (some? (:__type query-result))
+                   (string/includes? (:__type query-result) "ProvisionedThroughputExceeded"))
+              (do (Thread/sleep delay)
+                  (recur (min 60000 (* delay 2))))
 
-                (s/valid? ::anomalies/anomaly scan-result)
-                (throw (ex-info "could not scan tx-log" {:error scan-result}))
+              (s/valid? ::anomalies/anomaly query-result)
+              (throw (ex-info "could not query tx-log" {:error query-result}))
 
-                :else
-                (+ tree-key (get scan-result :Count 0))))))))
+              :else
+              (if-let [id (some-> query-result :Items first :id :S decode-tx-id)]
+                id
+                (or (hh/last-key (-> state deref :root)) 0)))))))
 
 (defn start-s3-client
   [_ {s3-client ::s3-client
@@ -500,24 +552,79 @@
       (aws/client {:api :dynamodb :region region :credentials-provider creds})))
 
 (defn start-tx-log
-  [{:keys [s3-client ddb-client cache]} {node-id ::node-id
-                                         bucket ::bucket
-                                         table-name ::table-name}]
+  [{:keys [s3-client ddb-client object-cache]} {node-id ::node-id
+                                                bucket ::bucket
+                                                table-name ::table-name}]
   (log/debug :task ::start-tx-log :phase :begin
              :node-id node-id :bucket bucket :table-name table-name)
   (let [tx-log (->HitchhikerTreeTxLog (or node-id (str (UUID/randomUUID)))
                                       (atom {})
-                                      (hhs3/->S3Backend s3-client bucket cache)
+                                      (hhs3/->S3Backend s3-client bucket object-cache)
                                       ddb-client
                                       table-name)]
     (hh/<?? (reload! tx-log))
     tx-log))
 
+;(def polling-consumer #'crux.tx.polling/polling-consumer)
+(defn- polling-consumer
+  [running? indexer event-log-consumer idle-sleep-ms]
+  (log/debug :task ::polling-consumer :phase :begin :idle-sleep-ms idle-sleep-ms)
+  (when-not (db/read-index-meta indexer :crux.tx-log/consumer-state)
+    (db/store-index-meta
+      indexer
+      :crux.tx-log/consumer-state {:crux.tx/event-log {:lag 0
+                                                       :next-offset 0
+                                                       :time nil}}))
+  (while @running?
+    (let [idle? (with-open [context (consumer/new-event-log-context event-log-consumer)]
+                  (let [next-offset (get-in (db/read-index-meta indexer :crux.tx-log/consumer-state) [:crux.tx/event-log :next-offset])]
+                    (if-let [^Message last-message (reduce (fn [last-message ^Message m]
+                                                             (log/debug :task ::polling-consumer :phase :process-message :message m)
+                                                             (case (get (.headers m) :crux.tx/sub-topic)
+                                                               :docs
+                                                               (db/index-doc indexer (.key m) (.body m))
+                                                               :txs
+                                                               (db/index-tx indexer
+                                                                            (.body m)
+                                                                            (.message-time m)
+                                                                            (.message-id m)))
+                                                             m)
+                                                           nil
+                                                           (consumer/next-events event-log-consumer context next-offset))]
+                      (let [end-offset (consumer/end-offset event-log-consumer)
+                            next-offset (inc (long (.message-id last-message)))
+                            lag (- end-offset next-offset)
+                            _ (when (pos? lag)
+                                (log/debug "Falling behind" ::event-log "at:" next-offset "end:" end-offset))
+                            consumer-state {:crux.tx/event-log
+                                            {:lag lag
+                                             :next-offset next-offset
+                                             :time (.message-time last-message)}}]
+                        (log/debug "Event log consumer state:" (pr-str consumer-state))
+                        (db/store-index-meta indexer :crux.tx-log/consumer-state consumer-state)
+                        false)
+                      true)))]
+      (log/debug :task ::polling-consumer :phase :events-processed :idle? idle?)
+      (when idle?
+        (Thread/sleep idle-sleep-ms)))))
+
 (defn start-event-log-consumer
-  [{indexer ::n/indexer tx-log ::n/tx-log} _]
+  [{indexer ::n/indexer tx-log ::n/tx-log} {idle-sleep-ms ::idle-sleep-ms :or {idle-sleep-ms 1000}}]
   (log/debug :task ::start-event-log-consumer :phase :begin
              :indexer indexer :tx-log tx-log)
-  (polling/start-event-log-consumer indexer (map->HitchhikerTreeTxLogConsumer tx-log)))
+  (let [running? (atom true)
+        worker-thread (doto (Thread. #(try
+                                        ; this impl copied here to use a longer idle sleep time
+                                        ; every 10ms might be too much for dynamodb
+                                        (polling-consumer running? indexer tx-log idle-sleep-ms)
+                                        (catch Throwable t
+                                          (log/fatal t "Event log consumer threw exception, consumption has stopped:")))
+                                     "crux.tx.event-log-consumer-thread")
+                        (.start))]
+    (reify Closeable
+      (close [_]
+        (reset! running? false)
+        (.join worker-thread)))))
 
 (defn make-object-cache
   [_ {threshold ::cache-threshold :or {threshold 32}}]
@@ -534,8 +641,9 @@
 (s/def ::bucket string?)
 (s/def ::table-name string?)
 (s/def ::queue-name string?)
+(s/def ::idle-time-ms pos-int?)
 (s/def ::tx-log-args (s/keys :req-un [::bucket ::table-name]))
-(s/def ::event-log-consumer-args (s/keys :req-un [::bucket ::table-name ::queue-name]))
+(s/def ::event-log-consumer-args (s/keys :req-un [::idle-time-ms]))
 
 (s/def ::threshold pos-int?)
 (s/def ::cache-args (s/keys :opt-un [::threshold]))
@@ -544,7 +652,7 @@
 (def s3-client [start-s3-client [] ::s3-client-args])
 (def ddb-client [start-ddb-client [] ::ddb-client-args])
 (def tx-log [start-tx-log [:s3-client :ddb-client :cache] ::tx-log-args])
-(def event-log-consumer [start-event-log-consumer [:indexer :tx-log]])
+(def event-log-consumer [start-event-log-consumer [:indexer :tx-log] ::event-log-consumer-args])
 
 (def node-config {:cache object-cache
                   :s3-client s3-client
@@ -598,4 +706,8 @@
                                          {:doc "This node's unique ID"
                                           :crux.config/type :crux.config/string}}}
                       ::event-log-consumer {:start-fn start-event-log-consumer
-                                            :deps [::n/indexer ::n/tx-log]}}))
+                                            :deps [::n/indexer ::n/tx-log]
+                                            :args {::idle-sleep-ms
+                                                   {:doc "Time to sleep between polls of DynamoDB"
+                                                    :crux.config/type :crux.config/nat-int
+                                                    :crux.config/default 1000}}}}))
