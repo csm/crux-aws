@@ -1,6 +1,6 @@
 # crux-aws
 
-[crux](https://juxt.pro/crux/) atop S3 and SQS.
+[crux](https://juxt.pro/crux/) atop S3 and DynamoDB.
 
 Experimental.
 
