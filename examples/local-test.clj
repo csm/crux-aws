@@ -82,40 +82,30 @@
                             :endpoint-override {:protocol "http"
                                                 :hostname "localhost"
                                                 :port (-> @s3 :bind-address (.getPort))}}))
-(def sqs-client (aws/client {:api :sqs
-                             :credentials-provider (creds/basic-credentials-provider {:access-key-id "ACCESSKEY"
-                                                                                      :secret-access-key "SECRETACCESSKEY"})
-                             :endpoint-override {:protocol "http"
-                                                 :hostname "localhost"
-                                                 :port (-> @s3 :sqs-server deref :bind-address (.getPort))}}))
 
 ; If you restart and still have your data on disk, skip the following four commands
 (aws/invoke ddb-client {:op :CreateTable
                         :request {:TableName "crux-aws"
-                                  :AttributeDefinitions [{:AttributeName "Id"
+                                  :AttributeDefinitions [{:AttributeName "topic"
+                                                          :AttributeType "S"}
+                                                         {:AttributeName "id"
                                                           :AttributeType "S"}]
-                                  :KeySchema [{:AttributeName "Id"
-                                               :KeyType "HASH"}]
+                                  :KeySchema [{:AttributeName "topic"
+                                               :KeyType "HASH"}
+                                              {:AttributeName "id"
+                                               :KeyType "RANGE"}]
                                   :ProvisionedThroughput {:ReadCapacityUnits 5
                                                           :WriteCapacityUnits 5}}})
 
 (aws/invoke s3-client {:op :CreateBucket :request {:Bucket "crux-aws"}})
-(aws/invoke sqs-client {:op :CreateQueue :request {:QueueName "crux-aws"}})
-(aws/invoke s3-client {:op :PutBucketNotificationConfiguration
-                       :request {:Bucket "crux-aws"
-                                 :NotificationConfiguration {:QueueConfigurations [{:Id "objects-created"
-                                                                                    :QueueArn "crux-aws"
-                                                                                    :Events ["s3:ObjectCreated:*"]}]}}})
 
 (require 'crux.aws)
 
-(def crux (crux.aws/start-aws-node {:s3-client s3-client
-                                    :ddb-client ddb-client
-                                    :sqs-client sqs-client
-                                    :bucket "crux-aws"
-                                    :table-name "crux-aws"
-                                    :queue-name "crux-aws"
-                                    :db-dir "data/index"}))
+(def crux (crux.aws/start-hh-node {:s3-client s3-client
+                                   :ddb-client ddb-client
+                                   :crux.tx.hitchhiker-tree/bucket "crux-aws"
+                                   :crux.tx.hitchhiker-tree/table-name "crux-aws"
+                                   :db-dir "data/index"}))
 
 (require 'crux.api)
 (import 'java.util.UUID)

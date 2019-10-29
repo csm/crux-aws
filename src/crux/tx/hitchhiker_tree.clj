@@ -60,6 +60,22 @@
         headers (nippy/thaw-from-in! input)]
     (crux.tx.consumer/->Message body topic message-id message-time key headers)))
 
+(defn anomaly?
+  [result]
+  (s/valid? ::anomalies/anomaly result))
+
+(defn throttle?
+  [result]
+  (and (anomaly? result)
+       (string? (:__type result))
+       (string/includes? (:__type result) "ProvisionedThroughputExceeded")))
+
+(defn conditional-failed?
+  [result]
+  (and (anomaly? result)
+       (string? (:message result))
+       (= "The conditional request failed" (:message result))))
+
 (defprotocol IContext
   (open! [_ from-tx-id]
     "Open the transaction log context."))
@@ -144,13 +160,11 @@
                                                                      :Key {"topic" {:S "metadata"}
                                                                            "id" {:S "tx-id"}}
                                                                      :ConsistentRead true}}))]
-      (cond (and (s/valid? ::anomalies/anomaly get-item)
-                 (some? (:__type get-item))
-                 (string/includes? (:__type get-item) "ProvisionedThroughputExceeded"))
+      (cond (throttle? get-item)
             (do (async/<! (async/timeout delay))
                 (recur (min 60000 (* delay 2))))
 
-            (s/valid? ::anomalies/anomaly get-item)
+            (anomaly? get-item)
             (ex-info "failed to read tx-id" {:error get-item})
 
             :else
@@ -171,18 +185,18 @@
                                                                                     "id" {:S "tx-id"}
                                                                                     "txid" {:N (str n)}}
                                                                              :ConditionExpression "attribute_not_exists(topic) AND attribute_not_exists(id)"}})))]
-              (if (s/valid? ::anomalies/anomaly result)
-                (cond
-                  (= "The conditional request failed" (:message result))
-                  (recur 500)
+              (cond
+                (conditional-failed? result)
+                (recur 500)
 
-                  (and (some? (:__type result))
-                       (string/includes? (:__type result) "ProvisionedThroughputExceeded"))
-                  (do (async/<! (async/timeout delay))
-                      (recur (min 60000 (* 2 delay))))
+                (throttle? result)
+                (do (async/<! (async/timeout delay))
+                    (recur (min 60000 (* 2 delay))))
 
-                  :else
-                  (ex-info "failed to update txid" {:error result}))
+                (anomaly? result)
+                (ex-info "failed to update txid" {:error result})
+
+                :else
                 (range (or last-txid 0) (+ (or last-txid 0) n))))))))
 
 (defn encode-tx-id
@@ -214,14 +228,12 @@
       (let [result (aws/invoke ddb-client {:op      :PutItem
                                            :request {:TableName table-name
                                                      :Item item}})]
-        (cond (and (s/valid? ::anomalies/anomaly result)
-                   (some? (:__type result))
-                   (string/includes? (:__type result) "ProvisionedThroughputExceeded"))
+        (cond (throttle? result)
               (do
                 (Thread/sleep delay)
                 (recur (min 60000 (* 2 delay))))
 
-              (s/valid? ::anomalies/anomaly result)
+              (anomaly? result)
               (throw (ex-info "failed to write to tx-log" {:error result}))
 
               :else {:index tx-id
@@ -294,172 +306,221 @@
   ITxLogReload
   (reload! [_]
     (hh/go-try
-      (let [item (async/<! (aws-async/invoke ddb-client {:op :GetItem
-                                                         :request {:TableName table-name
-                                                                   :Key {"topic" {:S "metadata"}
-                                                                         "id" {:S "root"}}
-                                                                   :ConsistentRead true}}))
-            metadata (cond (s/valid? ::anomalies/anomaly item) ; todo throttling
-                           (throw (ex-info "failed to read tree metadata" {:error item}))
+      (loop [delay 500]
+        (let [item (async/<! (aws-async/invoke ddb-client {:op :GetItem
+                                                           :request {:TableName table-name
+                                                                     :Key {"topic" {:S "metadata"}
+                                                                           "id" {:S "root"}}
+                                                                     :ConsistentRead true}}))]
+          (cond (throttle? item)
+                (do (async/<! (async/timeout delay))
+                    (recur (min 60000 (* 2 delay))))
 
-                           :else
-                           {:root-address (-> item :Item :root-address :S)
-                            :last-txlog-id (-> item :Item :last-txlog-id :S)})
-            root (if-let [addr (:root-address metadata)]
-                   (hh/<? (hhs3/create-tree-from-root-key backend addr))
-                   (hh/<? (hh/b-tree (hh/->Config 1024 2048 16))))]
-        (swap! state assoc :metadata metadata :root root))))
+                (anomaly? item)
+                (throw (ex-info "failed to read tree metadata" {:error item}))
+
+                :else (let [metadata {:root-address (-> item :Item :root-address :S)
+                                      :last-txlog-id (-> item :Item :last-txlog-id :S)}
+                             root (if-let [addr (:root-address metadata)]
+                                    (hh/<? (hhs3/create-tree-from-root-key backend addr))
+                                    (hh/<? (hh/b-tree (hh/->Config 1024 2048 16))))]
+                        (swap! state assoc :metadata metadata :root root)))))))
 
   ITxLogWriteBack
   (write-back! [this]
     (hh/go-try
-      (let [writer-state (async/<! (aws-async/invoke ddb-client {:op :GetItem
-                                                                 :request {:TableName table-name
-                                                                           :Key {"topic" {:S "metadata"}
-                                                                                 "id" {:S "writer-state"}}
-                                                                           :ConsistentRead true}}))]
-        (log/debug :task ::write-back! :phase :got-writer-state :writer-state writer-state)
-        (if (s/valid? ::anomalies/anomaly writer-state) ;todo handle throttling
-          (throw (ex-info "failed to read writer state" {:error writer-state}))
-          (do
-            (when-not (empty? writer-state)
-              (async/<! (async/timeout 1000)))
-            (let [token (.nextLong random)
-                  ; claim the writer lock
-                  claim-result (async/<!
-                                 (if (empty? writer-state)
-                                   (aws-async/invoke ddb-client {:op :PutItem
-                                                                 :request {:TableName table-name
-                                                                           :Item {"topic" {:S "metadata"}
-                                                                                  "id" {:S "writer-state"}
-                                                                                  "owner" {:S node-id}
-                                                                                  "token" {:N (str token)}}
-                                                                           :ConditionExpression "attribute_not_exists(#topic) and attribute_not_exists(#id)"
-                                                                           :ExpressionAttributeNames {"#topic" "topic"
-                                                                                                      "#id" "id"}}})
-                                   (aws-async/invoke ddb-client {:op :UpdateItem
-                                                                 :request {:TableName table-name
-                                                                           :Key {"topic" {:S "metadata"}
-                                                                                 "id" {:S "writer-state"}}
-                                                                           :UpdateExpression "SET #owner = :newOwner, #token = :newToken"
-                                                                           :ConditionExpression "#owner = :oldOwner and #token = :oldToken"
-                                                                           :ExpressionAttributeNames {"#owner" "owner"
-                                                                                                      "#token" "token"}
-                                                                           :ExpressionAttributeValues {":oldOwner" (-> writer-state :Item :owner)
-                                                                                                       ":oldToken" (-> writer-state :Item :token)
-                                                                                                       ":newOwner" {:S node-id}
-                                                                                                       ":newToken" {:N (str token)}}}})))]
-              (log/debug :task ::write-back! :phase :claim-attempt :result claim-result)
-              (if (s/valid? ::anomalies/anomaly claim-result)
-                (throw (ex-info "could not claim writer lock" {:error claim-result}))
-                ; unrolled async logic as a simple state machine loop.
-                ; This is so we can inject updates to our writer-lock
-                ; while we are performing the merge.
-                (loop [timeout 500
-                       phase :reload-tree
-                       root nil
-                       metadata nil
-                       token token
-                       partial-results []
-                       op-chan (reload! this)]
-                  (log/debug :task ::write-back! :phase phase
-                             :timeout timeout
-                             :root root
-                             :metadata metadata
-                             :token token
-                             :partial-results partial-results)
-                  (let [begin (System/currentTimeMillis)
-                        result (async/alt! op-chan ([v] v)
-                                           (async/timeout timeout) ::timeout)]
-                    (log/debug :task ::write-back! :phase phase :result result)
-                    (if (= result ::timeout)
-                      (let [new-token (unchecked-inc token)
-                            update-state (async/<! (aws-async/invoke ddb-client {:op :UpdateItem
-                                                                                 :request {:TableName table-name
-                                                                                           :Key {"topic" {:S "metadata"}
-                                                                                                 "id" {:S "writer-state"}}
-                                                                                           :UpdateExpression "SET #token = :newToken"
-                                                                                           :ConditionExpression "#owner = :me AND #token = :oldToken"
-                                                                                           :ExpressionAttributeNames {"#owner" "owner"
-                                                                                                                      "#token" "token"}
-                                                                                           :ExpressionAttributeValues {":oldToken" {:N (str token)}
-                                                                                                                       ":me" {:S node-id}
-                                                                                                                       ":newToken" {:N (str new-token)}}}}))]
-                        (if (s/valid? ::anomalies/anomaly update-state)
-                          (throw (ex-info "failed to update writer state" {:error update-state}))
-                          (recur 500 phase root metadata new-token partial-results op-chan)))
-                      (let [elapsed (- (System/currentTimeMillis) begin)
-                            next-timeout (max 0 (- 500 elapsed))]
-                        (case phase
-                          :reload-tree
-                          (if (instance? Throwable result)
-                            (throw result)
-                            (recur next-timeout :scanning-txlog (:root result) (:metadata result) token []
-                                   (aws-async/invoke ddb-client {:op :Scan
-                                                                 :request {:TableName table-name
-                                                                           :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}] :ComparisonOperator "EQ"}}
-                                                                           :ExclusiveStartKey {"topic" {:S "tx-log"}
-                                                                                               "id" {:S (or (-> state deref :metadata :last-txlog-id)
-                                                                                                            "00--")}}}})))
+      (loop [delay 500]
+        (let [writer-state (async/<! (aws-async/invoke ddb-client {:op :GetItem
+                                                                   :request {:TableName table-name
+                                                                             :Key {"topic" {:S "metadata"}
+                                                                                   "id" {:S "writer-state"}}
+                                                                             :ConsistentRead true}}))]
+          (log/debug :task ::write-back! :phase :got-writer-state :writer-state writer-state)
+          (cond
+            (throttle? writer-state)
+            (do (async/<! (async/timeout delay))
+                (recur (min 60000 (* 2 delay))))
 
-                          :scanning-txlog
-                          (if (s/valid? ::anomalies/anomaly result)
-                            (throw (ex-info "scanning tx-log failed" {:error result}))
-                            (let [messages (->> (:Items result)
-                                                (map (fn [{:keys [op tx-data tx-date doc-id sub-topic]}]
-                                                       {:op (-> op :S keyword)
-                                                        :tx-data (-> tx-data :B (ByteStreams/toByteArray) nippy/thaw)
-                                                        :tx-date (-> tx-date :S
-                                                                     (ZonedDateTime/parse DateTimeFormatter/ISO_OFFSET_DATE_TIME)
-                                                                     (.toInstant)
-                                                                     (.toEpochMilli)
-                                                                     (Date.))
-                                                        :doc-id (:S doc-id)
-                                                        :sub-topic (some-> (:S sub-topic) keyword)})))
-                                  new-partial-results (into partial-results messages)]
-                              (if (and (:LastEvaluatedKey result)
-                                       (< (count new-partial-results) 4096))
-                                (recur next-timeout :scanning-txlog root metadata token new-partial-results
-                                       (aws-async/invoke ddb-client {:op :Scan
-                                                                     :request {:TableName table-name
-                                                                               :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}]
-                                                                                                     :ComparisonOperator "EQ"}}
-                                                                               :ExclusiveStartKey (:LastEvaluatedKey result)}}))
-                                (recur next-timeout :merging-tree root metadata token (-> result :Items last :id :S)
-                                       (merge-tx-log root new-partial-results)))))
+            (anomaly? writer-state) ;todo handle throttling
+            (throw (ex-info "failed to read writer state" {:error writer-state}))
 
-                          :merging-tree
-                          (if (instance? Throwable result)
-                            (throw result)
-                            (recur next-timeout :flushing-tree result metadata token partial-results
-                                   (hh/flush-tree result backend)))
-
-                          :flushing-tree
-                          (if (instance? Throwable result)
-                            (throw result)
-                            (recur next-timeout :committing-metadata root metadata token []
-                                   (if (nil? (:root-address metadata))
+            :else
+            (do
+              (when-not (empty? writer-state)
+                (async/<! (async/timeout 1000)))
+              (let [token (.nextLong random)
+                    ; claim the writer lock
+                    claim-result (async/<!
+                                   (if (empty? writer-state)
                                      (aws-async/invoke ddb-client {:op :PutItem
                                                                    :request {:TableName table-name
                                                                              :Item {"topic" {:S "metadata"}
-                                                                                    "id" {:S "root"}
-                                                                                    "root-address" {:S (str (:guid (hh/<? (:storage-addr root))))}
-                                                                                    "last-txlog-id" {:S partial-results}}
-                                                                             :ConditionExpression "attribute_not_exists(topic) AND attribute_not_exists(id)"}})
+                                                                                    "id" {:S "writer-state"}
+                                                                                    "owner" {:S node-id}
+                                                                                    "token" {:N (str token)}}
+                                                                             :ConditionExpression "attribute_not_exists(#topic) and attribute_not_exists(#id)"
+                                                                             :ExpressionAttributeNames {"#topic" "topic"
+                                                                                                        "#id" "id"}}})
                                      (aws-async/invoke ddb-client {:op :UpdateItem
                                                                    :request {:TableName table-name
                                                                              :Key {"topic" {:S "metadata"}
-                                                                                   "id" {:S "root"}}
-                                                                             :UpdateExpression "SET #root = :newRoot, #lastTxid = :lastTxId"
-                                                                             :ConditionExpression "#root = :curRoot"
-                                                                             :ExpressionAttributeNames {"#root" "root-address"
-                                                                                                        "#lastTxid" "last-txlog-id"}
-                                                                             :ExpressionAttributeValues {":newRoot" {:S (str (:guid (hh/<? (:storage-addr root))))}
-                                                                                                         ":curRoot" {:S (:root-address metadata)}
-                                                                                                         ":lastTxId" {:S partial-results}}}}))))
-                          :committing-metadata
-                          (when (s/valid? ::anomalies/anomaly result)
-                            (throw (ex-info "failed to commit tree metadata" {:error result})))))))))))))))
+                                                                                   "id" {:S "writer-state"}}
+                                                                             :UpdateExpression "SET #owner = :newOwner, #token = :newToken"
+                                                                             :ConditionExpression "#owner = :oldOwner and #token = :oldToken"
+                                                                             :ExpressionAttributeNames {"#owner" "owner"
+                                                                                                        "#token" "token"}
+                                                                             :ExpressionAttributeValues {":oldOwner" (-> writer-state :Item :owner)
+                                                                                                         ":oldToken" (-> writer-state :Item :token)
+                                                                                                         ":newOwner" {:S node-id}
+                                                                                                         ":newToken" {:N (str token)}}}})))]
+                (log/debug :task ::write-back! :phase :claim-attempt :result claim-result)
+                (cond
+                  (throttle? claim-result)
+                  (do
+                    (async/<! (async/timeout delay))
+                    (recur (min 60000 (* 2 delay))))
+
+                  (anomaly? claim-result)
+                  (throw (ex-info "could not claim writer lock" {:error claim-result}))
+
+                  ; unrolled async logic as a simple state machine loop.
+                  ; This is so we can inject updates to our writer-lock
+                  ; while we are performing the merge.
+                  :else
+                  (loop [timeout 500
+                         phase :reload-tree
+                         root nil
+                         metadata nil
+                         token token
+                         partial-results []
+                         op-chan (reload! this)
+                         prev-aws-call nil
+                         delay 500]
+                    (log/debug :task ::write-back! :phase phase
+                               :timeout timeout
+                               ;:root root
+                               :metadata metadata
+                               :token token
+                               :partial-results partial-results)
+                    (let [begin (System/currentTimeMillis)
+                          result (async/alt! op-chan ([v] v)
+                                             (async/timeout timeout) ::timeout)]
+                      (log/debug :task ::write-back! :phase phase :result result)
+                      (if (= result ::timeout)
+                        (let [new-token (unchecked-inc token)
+                              update-state (async/<! (aws-async/invoke ddb-client {:op :UpdateItem
+                                                                                   :request {:TableName table-name
+                                                                                             :Key {"topic" {:S "metadata"}
+                                                                                                   "id" {:S "writer-state"}}
+                                                                                             :UpdateExpression "SET #token = :newToken"
+                                                                                             :ConditionExpression "#owner = :me AND #token = :oldToken"
+                                                                                             :ExpressionAttributeNames {"#owner" "owner"
+                                                                                                                        "#token" "token"}
+                                                                                             :ExpressionAttributeValues {":oldToken" {:N (str token)}
+                                                                                                                         ":me" {:S node-id}
+                                                                                                                         ":newToken" {:N (str new-token)}}}}))]
+                          (cond
+                            (throttle? update-state)
+                            (do (async/<! (async/timeout delay))
+                                (recur 0 phase root metadata new-token partial-results op-chan prev-aws-call (min 60000 (* 2 delay))))
+
+                            (anomaly? update-state)
+                            (throw (ex-info "failed to update writer state" {:error update-state}))
+
+                            :else
+                            (recur 500 phase root metadata new-token partial-results op-chan prev-aws-call 500)))
+                        (let [elapsed (- (System/currentTimeMillis) begin)
+                              next-timeout (max 0 (- 500 elapsed))]
+                          (case phase
+                            :reload-tree
+                            (if (instance? Throwable result)
+                              (throw result)
+                              (let [aws-call {:op :Scan
+                                              :request {:TableName table-name
+                                                        :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}] :ComparisonOperator "EQ"}}
+                                                        :ExclusiveStartKey {"topic" {:S "tx-log"}
+                                                                            "id" {:S (or (-> state deref :metadata :last-txlog-id)
+                                                                                         "00--")}}}}]
+                                (recur next-timeout :scanning-txlog (:root result) (:metadata result) token []
+                                       (aws-async/invoke ddb-client aws-call) aws-call 500)))
+
+                            :scanning-txlog
+                            (cond
+                              (throttle? result)
+                              (do (async/<! (async/timeout delay))
+                                  (recur next-timeout phase root metadata token partial-results
+                                         (aws-async/invoke ddb-client prev-aws-call) prev-aws-call
+                                         (min 60000 (* 2 delay))))
+
+                              (anomaly? result)
+                              (throw (ex-info "scanning tx-log failed" {:error result}))
+
+                              :else
+                              (let [messages (->> (:Items result)
+                                                  (map (fn [{:keys [op tx-data tx-date doc-id sub-topic]}]
+                                                         {:op (-> op :S keyword)
+                                                          :tx-data (-> tx-data :B (ByteStreams/toByteArray) nippy/thaw)
+                                                          :tx-date (-> tx-date :S
+                                                                       (ZonedDateTime/parse DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+                                                                       (.toInstant)
+                                                                       (.toEpochMilli)
+                                                                       (Date.))
+                                                          :doc-id (:S doc-id)
+                                                          :sub-topic (some-> (:S sub-topic) keyword)})))
+                                    new-partial-results (into partial-results messages)]
+                                (if (and (:LastEvaluatedKey result)
+                                         (< (count new-partial-results) 4096))
+                                  (let [aws-call {:op :Scan
+                                                  :request {:TableName table-name
+                                                            :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}]
+                                                                                  :ComparisonOperator "EQ"}}
+                                                            :ExclusiveStartKey (:LastEvaluatedKey result)}}]
+                                    (recur next-timeout :scanning-txlog root metadata token new-partial-results
+                                           (aws-async/invoke ddb-client aws-call) aws-call 500))
+                                  (recur next-timeout :merging-tree root metadata token (-> result :Items last :id :S)
+                                         (merge-tx-log root new-partial-results) nil 500))))
+
+                            :merging-tree
+                            (if (instance? Throwable result)
+                              (throw result)
+                              (recur next-timeout :flushing-tree result metadata token partial-results
+                                     (hh/flush-tree result backend) nil 500))
+
+                            :flushing-tree
+                            (if (instance? Throwable result)
+                              (throw result)
+                              (let [aws-call (if (nil? (:root-address metadata))
+                                               {:op :PutItem
+                                                :request {:TableName table-name
+                                                          :Item {"topic" {:S "metadata"}
+                                                                 "id" {:S "root"}
+                                                                 "root-address" {:S (str (:guid (hh/<? (:storage-addr root))))}
+                                                                 "last-txlog-id" {:S partial-results}}
+                                                          :ConditionExpression "attribute_not_exists(topic) AND attribute_not_exists(id)"}}
+                                               {:op :UpdateItem
+                                                :request {:TableName table-name
+                                                          :Key {"topic" {:S "metadata"}
+                                                                "id" {:S "root"}}
+                                                          :UpdateExpression "SET #root = :newRoot, #lastTxid = :lastTxId"
+                                                          :ConditionExpression "#root = :curRoot"
+                                                          :ExpressionAttributeNames {"#root" "root-address"
+                                                                                     "#lastTxid" "last-txlog-id"}
+                                                          :ExpressionAttributeValues {":newRoot" {:S (str (:guid (hh/<? (:storage-addr root))))}
+                                                                                      ":curRoot" {:S (:root-address metadata)}
+                                                                                      ":lastTxId" {:S partial-results}}}})]
+                                (recur next-timeout :committing-metadata root metadata token []
+                                       (aws-async/invoke ddb-client aws-call) aws-call 500)))
+
+                            :committing-metadata
+                            (cond
+                              (throttle? result)
+                              (do (async/<! (async/timeout delay))
+                                  (recur next-timeout phase root metadata token []
+                                         (aws-async/invoke ddb-client prev-aws-call) prev-aws-call
+                                         (min 60000 (* 2 delay))))
+
+                              (anomaly? result)
+                              (throw (ex-info "failed to commit tree metadata" {:error result}))))))))))))))))
 
   consumer/PolledEventLog
   (new-event-log-context [_]
@@ -485,33 +546,38 @@
                        items))
                    [])
           remaining (when (< (count events) 1024)
-                      (let [next-offset (+ next-offset (count events))
-                            txlog-key (if (pos? next-offset)
-                                        (encode-tx-id (dec next-offset))
-                                        "0")
-                            result (aws/invoke ddb-client {:op :Scan
-                                                           :request {:TableName table-name
-                                                                     :ExclusiveStartKey {"topic" {:S "tx-log"}
-                                                                                         "id" {:S txlog-key}}
-                                                                     :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}]
-                                                                                           :ComparisonOperator "EQ"}}}})]
-                        (log/debug :task ::consumer/next-events :phase :scanned-ddb :result result)
-                        (cond (s/valid? ::anomalies/anomaly result) ; todo handle throttles
-                              (throw (ex-info "failed to scan tx-log" {:error result}))
+                      (loop [delay 500]
+                        (let [next-offset (+ next-offset (count events))
+                              txlog-key (if (pos? next-offset)
+                                          (encode-tx-id (dec next-offset))
+                                          "0")
+                              result (aws/invoke ddb-client {:op :Scan
+                                                             :request {:TableName table-name
+                                                                       :ExclusiveStartKey {"topic" {:S "tx-log"}
+                                                                                           "id" {:S txlog-key}}
+                                                                       :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}]
+                                                                                             :ComparisonOperator "EQ"}}}})]
+                          (log/debug :task ::consumer/next-events :phase :scanned-ddb :result result)
+                          (cond (throttle? result)
+                                (do (async/<!! (async/timeout delay))
+                                    (recur (min 60000 (* 2 delay))))
 
-                              :else
-                              (->> (:Items result)
-                                   (map (fn [{:keys [id tx-date tx-data sub-topic doc-id]}]
-                                          (consumer/->Message (nippy/thaw (ByteStreams/toByteArray (:B tx-data)))
-                                                              nil
-                                                              (decode-tx-id (:S id))
-                                                              (-> (:S tx-date)
-                                                                  (ZonedDateTime/parse DateTimeFormatter/ISO_OFFSET_DATE_TIME)
-                                                                  (.toInstant)
-                                                                  (.toEpochMilli)
-                                                                  (Date.))
-                                                              (:S doc-id)
-                                                              {::tx/sub-topic (some-> (:S sub-topic) keyword)})))))))]
+                                (anomaly? result) ; todo handle throttles
+                                (throw (ex-info "failed to scan tx-log" {:error result}))
+
+                                :else
+                                (->> (:Items result)
+                                     (map (fn [{:keys [id tx-date tx-data sub-topic doc-id]}]
+                                            (consumer/->Message (nippy/thaw (ByteStreams/toByteArray (:B tx-data)))
+                                                                nil
+                                                                (decode-tx-id (:S id))
+                                                                (-> (:S tx-date)
+                                                                    (ZonedDateTime/parse DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+                                                                    (.toInstant)
+                                                                    (.toEpochMilli)
+                                                                    (Date.))
+                                                                (:S doc-id)
+                                                                {::tx/sub-topic (some-> (:S sub-topic) keyword)}))))))))]
       (into events remaining)))
 
   (end-offset [_]
@@ -567,56 +633,78 @@
 
 ;(def polling-consumer #'crux.tx.polling/polling-consumer)
 (defn- polling-consumer
-  [running? indexer event-log-consumer idle-sleep-ms]
-  (log/debug :task ::polling-consumer :phase :begin :idle-sleep-ms idle-sleep-ms)
-  (when-not (db/read-index-meta indexer :crux.tx-log/consumer-state)
-    (db/store-index-meta
-      indexer
-      :crux.tx-log/consumer-state {:crux.tx/event-log {:lag 0
-                                                       :next-offset 0
-                                                       :time nil}}))
-  (while @running?
-    (let [idle? (with-open [context (consumer/new-event-log-context event-log-consumer)]
-                  (let [next-offset (get-in (db/read-index-meta indexer :crux.tx-log/consumer-state) [:crux.tx/event-log :next-offset])]
-                    (if-let [^Message last-message (reduce (fn [last-message ^Message m]
-                                                             (log/debug :task ::polling-consumer :phase :process-message :message m)
-                                                             (case (get (.headers m) :crux.tx/sub-topic)
-                                                               :docs
-                                                               (db/index-doc indexer (.key m) (.body m))
-                                                               :txs
-                                                               (db/index-tx indexer
-                                                                            (.body m)
-                                                                            (.message-time m)
-                                                                            (.message-id m)))
-                                                             m)
-                                                           nil
-                                                           (consumer/next-events event-log-consumer context next-offset))]
-                      (let [end-offset (consumer/end-offset event-log-consumer)
-                            next-offset (inc (long (.message-id last-message)))
-                            lag (- end-offset next-offset)
-                            _ (when (pos? lag)
-                                (log/debug "Falling behind" ::event-log "at:" next-offset "end:" end-offset))
-                            consumer-state {:crux.tx/event-log
-                                            {:lag lag
-                                             :next-offset next-offset
-                                             :time (.message-time last-message)}}]
-                        (log/debug "Event log consumer state:" (pr-str consumer-state))
-                        (db/store-index-meta indexer :crux.tx-log/consumer-state consumer-state)
-                        false)
-                      true)))]
-      (log/debug :task ::polling-consumer :phase :events-processed :idle? idle?)
-      (when idle?
-        (Thread/sleep idle-sleep-ms)))))
+  [running? indexer event-log-consumer sqs-client queue-name idle-sleep-ms]
+  (log/debug :task ::polling-consumer :phase :begin :idle-sleep-ms idle-sleep-ms :queue-name queue-name)
+  (let [queue-url (some-> sqs-client (aws/invoke {:op :GetQueueUrl :request {:QueueName queue-name}}) :QueueUrl)]
+    (when-not (db/read-index-meta indexer :crux.tx-log/consumer-state)
+      (db/store-index-meta
+        indexer
+        :crux.tx-log/consumer-state {:crux.tx/event-log {:lag 0
+                                                         :next-offset 0
+                                                         :time nil}}))
+    (while @running?
+      (let [idle? (with-open [context (consumer/new-event-log-context event-log-consumer)]
+                    (let [next-offset (get-in (db/read-index-meta indexer :crux.tx-log/consumer-state) [:crux.tx/event-log :next-offset])]
+                      (if-let [^Message last-message (reduce (fn [last-message ^Message m]
+                                                               (log/debug :task ::polling-consumer :phase :process-message :message m)
+                                                               (case (get (.headers m) :crux.tx/sub-topic)
+                                                                 :docs
+                                                                 (db/index-doc indexer (.key m) (.body m))
+                                                                 :txs
+                                                                 (db/index-tx indexer
+                                                                              (.body m)
+                                                                              (.message-time m)
+                                                                              (.message-id m)))
+                                                               m)
+                                                             nil
+                                                             (consumer/next-events event-log-consumer context next-offset))]
+                        (let [end-offset (consumer/end-offset event-log-consumer)
+                              next-offset (inc (long (.message-id last-message)))
+                              lag (- end-offset next-offset)
+                              _ (when (pos? lag)
+                                  (log/debug "Falling behind" ::event-log "at:" next-offset "end:" end-offset))
+                              consumer-state {:crux.tx/event-log
+                                              {:lag lag
+                                               :next-offset next-offset
+                                               :time (.message-time last-message)}}]
+                          (log/debug "Event log consumer state:" (pr-str consumer-state))
+                          (db/store-index-meta indexer :crux.tx-log/consumer-state consumer-state)
+                          false)
+                        true)))]
+        (log/debug :task ::polling-consumer :phase :events-processed :idle? idle?)
+        (when idle?
+          (if (some? queue-url)
+            (let [messages (aws/invoke sqs-client {:op :ReceiveMessage
+                                                   :request {:QueueUrl queue-url
+                                                             :WaitTimeSeconds 20
+                                                             :MaxNumberOfMessages 10}})]
+              (log/debug "sqs messages:" messages)
+              (doseq [m (:Messages messages)]
+                (aws/invoke sqs-client {:op :DeleteMessage
+                                        :request {:QueueUrl queue-url
+                                                  :ReceiptHandle (:ReceiptHandle m)}})))
+            (Thread/sleep idle-sleep-ms)))))))
 
 (defn start-event-log-consumer
-  [{indexer ::n/indexer tx-log ::n/tx-log} {idle-sleep-ms ::idle-sleep-ms :or {idle-sleep-ms 1000}}]
+  [{indexer ::n/indexer tx-log ::n/tx-log} {consumer-type ::consumer-type
+                                            idle-sleep-ms ::idle-sleep-ms
+                                            sqs-client    ::sqs-client
+                                            region        ::region
+                                            creds         ::creds
+                                            queue-name    ::queue-name
+                                            :or {idle-sleep-ms 1000
+                                                 consumer-type :polling}}]
   (log/debug :task ::start-event-log-consumer :phase :begin
              :indexer indexer :tx-log tx-log)
+  (when (and (= :sqs consumer-type) (string/blank? queue-name))
+    (throw (IllegalArgumentException. "missing queue-name for SQS consumer")))
   (let [running? (atom true)
+        sqs-client (or sqs-client (when (= consumer-type :sqs)
+                                    (aws/client {:api :sqs :region region :credentials-provider creds})))
         worker-thread (doto (Thread. #(try
                                         ; this impl copied here to use a longer idle sleep time
                                         ; every 10ms might be too much for dynamodb
-                                        (polling-consumer running? indexer tx-log idle-sleep-ms)
+                                        (polling-consumer running? indexer tx-log sqs-client queue-name idle-sleep-ms)
                                         (catch Throwable t
                                           (log/fatal t "Event log consumer threw exception, consumption has stopped:")))
                                      "crux.tx.event-log-consumer-thread")
@@ -707,7 +795,26 @@
                                           :crux.config/type :crux.config/string}}}
                       ::event-log-consumer {:start-fn start-event-log-consumer
                                             :deps [::n/indexer ::n/tx-log]
-                                            :args {::idle-sleep-ms
-                                                   {:doc "Time to sleep between polls of DynamoDB"
+                                            :args {::consumer-type
+                                                   {:doc "The consumer type. Valid types are :polling, :sqs"
+                                                    :crux.config/type [(fn [x] (#{:polling :sqs} x))
+                                                                       identity]
+                                                    :crux.config/default :polling}
+                                                   ::sqs-client
+                                                   {:doc "An explicit SQS client for :sqs consumers"
+                                                    :crux.config/type [(fn [x] (s/valid? ::sqs-client x))
+                                                                       identity]}
+                                                   ::region
+                                                   {:doc "The AWS region"
+                                                    :crux.config/type :crux.config/string}
+                                                   ::creds
+                                                   {:doc "AWS credentials provider"
+                                                    :crux.config/type [(fn [x] (s/valid? ::creds x))
+                                                                       identity]}
+                                                   ::queue-name
+                                                   {:doc "SQS queue name, for :sqs consumers"
+                                                    :crux.config/type :crux.config/string}
+                                                   ::idle-sleep-ms
+                                                   {:doc "Time to sleep between polls of DynamoDB, for :polling consumers"
                                                     :crux.config/type :crux.config/nat-int
                                                     :crux.config/default 1000}}}}))

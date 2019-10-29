@@ -17,26 +17,52 @@
   (let [config (if (nil? (:kv-backend config))
                  (assoc config :kv-backend "crux.kv.rocksdb.RocksKv")
                  config)]
-    (n/start (assoc config :crux.node/topology crux-hh/topology))))
+    (n/start
+      (assoc config :crux.node/topology crux-hh/topology))))
 
 (comment
-  "You'll want an S3 bucket, DynamoDB table, and SQS queue.
+  "You'll want an S3 bucket and DynamoDB table at minimum.
 
   The bucket should be a vanilla bucket -- versioning not needed.
 
-  The DynamoDB table should have:
-    AttributeDefinition Name \"Id\" Type \"S\".
-    KeySchema Name \"Id\" KeyType \"HASH\".
+  The DynamoDB table should have table spec:
 
-  DynamoDB is only used to track an atomic counter, so it should
-  not consume much storage space at all; the read and write capacity
-  should be equal, since it always does a read-then-conditional-update.
+    Attribute definitions:
+    topic, type S
+    id, type S
 
-  The SQS queue should be configured to receive s3:ObjectCreated:*
-  events, either directly or via an SNS topic."
+    Key schema:
+    topic, key type HASH
+    id, key type RANGE
 
-  (start-aws-node {:region     "us-west-2"
-                   :table-name "your-dynamodb-table"
-                   :bucket     "your-s3-bucket"
-                   :sqs-queue  "your-sqs-queue"}))
+  For doing real-time indexing as the tx-log is added to, you can
+  also create a DynamoDB stream that publishes to a lambda, which
+  pushes to an SNS topic, and finally subscribe an SQS queue to
+  that topic. The alternative just polls DynamoDB for new
+  transactions.
+
+  Example lambda code:
+
+  var AWS = require('aws-sdk');
+  exports.handler = async (event, context) => {
+    var sns = new AWS.SNS();
+    var logAltered = false;
+    for (const record of event.Records) {
+      if (record.dynamodb['Keys']['topic']['S'] === 'tx-log') {
+        logAltered = true;
+        break;
+      }
+    }
+    if (logAltered) {
+      var result = await sns.publish({TopicArn: 'topic-arn-here',
+                                      Message: JSON.stringify({Cause: \"tx-log\"})}).promise();
+      console.log(`sns result: ${result}`);
+    }
+    return `Triggered tx-log event? ${logAltered}`;
+  };"
+
+  (start-aws-node {:crux.tx.hitchhiker-tree/region     "us-west-2"
+                   :crux.tx.hitchhiker-tree/table-name "your-dynamodb-table"
+                   :crux.tx.hitchhiker-tree/bucket     "your-s3-bucket"
+                   :crux.tx.hitchhiker-tree/queue-name "your-sqs-queue"}))
 
