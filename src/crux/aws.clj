@@ -35,6 +35,8 @@
     topic, key type HASH
     id, key type RANGE
 
+  Also configure TTL on your table on the 'expires' attribute.
+
   For doing real-time indexing as the tx-log is added to, you can
   also create a DynamoDB stream that publishes to a lambda, which
   pushes to an SNS topic, and finally subscribe an SQS queue to
