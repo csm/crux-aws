@@ -59,7 +59,7 @@
                                                   :storage-addr nil) cs))))
     (assoc node :storage-addr nil)))
 
-(defrecord S3Backend [s3-client bucket cache]
+(defrecord S3Backend [s3-client bucket cache anchor-chan anchor-mult]
   core/IBackend
   (new-session [_]
     (atom {:writes 0 :deletes 0}))
@@ -81,12 +81,23 @@
         address)))
 
   (anchor-root [this node]
-    (async/go
-      (async/<! (async/timeout 5000))
-      (when-let [addr (some-> (:storage-addr node) async/<!)]
-        (let [rez (core/delete-addr this addr (atom {:deletes 0}))]
-          (when-let [ch (some-> rez meta :channel)]
-            (async/<! ch)))))
+    ; "block" deleting this node until we get a signal that it is
+    ; safe to do so; I'm doing it this way so that we only delete things
+    ; after we do our other operations (write the latest root pointer to
+    ; DynamoDB). If writing to dynamodb fails for whatever reason, we can
+    ; abort the deletes.
+    ; Anyway, I think that's what is going on. Maybe I'm misunderstanding
+    ; how hh-trees are working here, "anchor-root" is kind of a weird name
+    ; if it's supposed to delete things.
+    (let [chan (async/tap anchor-mult (async/chan))]
+      (async/go
+        (when-let [anchor-rez (async/<! chan)]
+          (when (= ::commit anchor-rez)
+            (when-let [addr (some-> (:storage-addr node) async/poll!)]
+              (let [rez (core/delete-addr this addr (atom {:deletes 0}))]
+                (when-let [ch (some-> rez meta :channel)]
+                  (async/<! ch)))))
+          (async/untap anchor-mult chan))))
     node)
 
   (delete-addr [_ addr session]
@@ -100,7 +111,7 @@
                                                                       :error result})
 
                                   :else
-                                  nil)))]
+                                  (swap! cache cache/evict addr))))]
         (with-meta (swap! session update :deletes inc) {:channel delete-chan}))
       @session)))
 

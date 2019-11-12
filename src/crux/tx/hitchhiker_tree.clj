@@ -7,6 +7,7 @@
             [cognitect.anomalies :as anomalies]
             [cognitect.aws.client.api :as aws]
             [cognitect.aws.client.api.async :as aws-async]
+            [crux.aws.util :refer :all]
             [crux.db :as db]
             [crux.index :as idx]
             [hitchhiker.tree.core :as hh]
@@ -18,7 +19,7 @@
             [clojure.tools.logging :as log]
             [clojure.core.cache :as cache]
             [crux.node :as n])
-  (:import [java.io Closeable]
+  (:import [java.io Closeable OutputStream DataOutputStream]
            [java.nio ByteBuffer]
            [java.security SecureRandom]
            [java.time ZonedDateTime ZoneOffset]
@@ -74,41 +75,26 @@
         headers (nippy/thaw-from-in! input)]
     (crux.tx.consumer/->Message body topic message-id message-time key headers)))
 
-(defn anomaly?
-  [result]
-  (s/valid? ::anomalies/anomaly result))
-
-(defn throttle?
-  [result]
-  (and (anomaly? result)
-       (string? (:__type result))
-       (string/includes? (:__type result) "ProvisionedThroughputExceeded")))
-
-(defn conditional-failed?
-  [result]
-  (and (anomaly? result)
-       (string? (:message result))
-       (= "The conditional request failed" (:message result))))
-
 (defn merge-tx-log
   [tree txes]
   (hh/go-try
-    (let [last-key (hh/last-key tree)]
-      (loop [k (inc (or last-key -1))
-             txes txes
-             tree tree]
-        (if-let [tx (first txes)]
-          (let [{:keys [op tx-data tx-date doc-id sub-topic]} tx]
-            (case op
-              :insert
-              (recur (inc k) (rest txes)
-                     (hh/<? (hh/insert tree k (consumer/->Message tx-data
-                                                                  nil
-                                                                  k
-                                                                  tx-date
-                                                                  doc-id
-                                                                  {::tx/sub-topic (some-> sub-topic keyword)}))))))
-          tree)))))
+    (loop [txes txes
+           tree tree]
+      (if-let [tx (first txes)]
+        (let [{:keys [tx-id tx-date tx-data]} tx
+              merged (loop [tx-data tx-data
+                            tree tree]
+                       (if-let [tx-doc (first tx-data)]
+                         (recur (rest tx-data)
+                                (hh/<? (hh/insert tree tx-id (consumer/->Message (:doc tx-doc)
+                                                                                 nil
+                                                                                 tx-id
+                                                                                 tx-date
+                                                                                 (:doc-id tx-doc)
+                                                                                 {::tx/sub-topic (some-> tx-doc :topic keyword)}))))
+                         tree))]
+          (recur (rest txes) merged))
+        tree))))
 
 ; TODO I can't really get any better than doing an atomic
 ; increment on a row in dynamodb. It would be nice if we could
@@ -212,6 +198,31 @@
                                 (.toEpochMilli)
                                 (Date.))})))))
 
+(defn txlog-insert!
+  [ddb-client table-name tx-id data]
+  (hh/go-try
+    (let [encoded-data (nippy/freeze data)
+          encoded-tx-id (encode-tx-id tx-id)
+          tx-date (ZonedDateTime/now ZoneOffset/UTC)
+          item {"topic"   {:S "tx-log"}
+                "id"      {:S encoded-tx-id}
+                "tx-date" {:S (.format tx-date DateTimeFormatter/ISO_OFFSET_DATE_TIME)}
+                "tx-data" {:B encoded-data}}]
+      (loop [delay 500]
+        (let [result (async/<! (aws-async/invoke ddb-client {:op :PutItem
+                                                             :request {:TableName table-name
+                                                                       :Item item}}))]
+          (cond (throttle? result)
+                (do
+                  (Thread/sleep delay)
+                  (recur (min 60000 (* 2 delay))))
+
+                (anomaly? result)
+                (throw (ex-info "failed to write to tx-log" {:error result}))
+
+                :else {:index tx-id
+                       :date  (-> tx-date (.toInstant) (.toEpochMilli) (Date.))}))))))
+
 (defn evict-doc!
   [ddb-client table-name id]
   (log/warn "TODO doc eviction"))
@@ -250,25 +261,63 @@
       (log/debug :task ::possibly-flush-txlog :phase :flushing-now :last-tx-id last-tx-id :last-tree-id last-tree-id)
       (hh/<?? (write-back! tx-log)))))
 
+(defn estimate-frozen-size
+  [v]
+  (let [size (volatile! 0)
+        output-stream (proxy [OutputStream] []
+                        (write
+                          ([b]
+                           (cond (integer? b) (vswap! size inc)
+                                 (bytes? b) (vswap! size + (alength b))))
+                          ([_ _ l] (vswap! size + l))))
+        data-output (DataOutputStream. output-stream)]
+    (nippy/freeze-to-out! data-output v)
+    (+ @size 4)))
+
+; todo do dynamodb limits count bytes or base64 bytes?
+; just set this limit to 256kiB for now, might be able to go higher.
+(def txlog-limit (* 256 1024))
+
+(defn package-tx-data
+  [docs]
+  (let [estimated-size (estimate-frozen-size docs)]
+    (cond (< estimated-size txlog-limit)
+          [docs]
+
+          (< 1 (count docs))
+          (let [pivot (long (/ (count docs) 2))] ; todo split on size instead?
+            (vec (concat (package-tx-data (take pivot docs))
+                         (package-tx-data (drop pivot docs)))))
+
+          :else
+          (throw (ex-info "overflow; single doc would overflow size limit" {:size estimated-size})))))
+
 (defrecord HitchhikerTreeTxLog [node-id state backend ddb-client table-name]
   db/TxLog
   (submit-doc [this content-hash doc]
     (let [tx-id (first (hh/<?? (generate-tx-ids ddb-client table-name 1)))]
       (if (idx/evicted-doc? doc)
         (evict-doc! ddb-client table-name (str content-hash))
-        (insert-doc! ddb-client table-name tx-id (str content-hash) doc "docs"))
+        (txlog-insert! ddb-client table-name tx-id [{:doc-id (str content-hash)
+                                                     :doc doc
+                                                     :topic "docs"}]))
       (possibly-flush-txlog this tx-id)))
 
   (submit-tx [this tx-ops]
-    (let [docs (tx/tx-ops->docs tx-ops)
-          tx-ids (hh/<?? (generate-tx-ids ddb-client table-name (inc (count docs))))]
-      (doseq [[doc tx-id] (map vector docs (butlast tx-ids))]
-        (insert-doc! ddb-client table-name tx-id (str (c/new-id doc)) doc "docs"))
-      (let [tx-events (tx/tx-ops->tx-events tx-ops)
-            tx (insert-doc! ddb-client table-name (last tx-ids) nil tx-events "txs")]
-        (possibly-flush-txlog this (last tx-ids))
-        (delay {:crux.tx/tx-id   (:index tx)
-                :crux.tx/tx-time (:date tx)}))))
+    (let [docs (mapv #(hash-map :doc-id (str (c/new-id %)) :doc % :topic "docs")
+                     (tx/tx-ops->docs tx-ops))
+          tx-events [{:doc (tx/tx-ops->tx-events tx-ops) :topic "txs"}]
+          tx-data (package-tx-data (into docs tx-events))
+          tx-ids (hh/<?? (generate-tx-ids ddb-client table-name (count tx-data)))
+          tx (loop [txes (map vector tx-ids tx-data)
+                    result nil]
+               (if-let [[id data] (first txes)]
+                 (let [rez (txlog-insert! ddb-client table-name id data)]
+                   (recur (rest txes) rez))
+                 result))]
+      (possibly-flush-txlog this (last tx-ids))
+      (delay {:crux.tx/tx-id (:index tx)
+              :crux.tx/tx-time (:date tx)})))
 
   (new-tx-log-context [_]
     (->HitchhikerTreeTxLogConsumerContext (:root @state)))
@@ -287,7 +336,7 @@
         (let [item (async/<! (aws-async/invoke ddb-client {:op :GetItem
                                                            :request {:TableName table-name
                                                                      :Key {"topic" {:S "metadata"}
-                                                                           "id" {:S "root"}}
+                                                                           "id"    {:S "root"}}
                                                                      :ConsistentRead true}}))]
           (cond (throttle? item)
                 (do (async/<! (async/timeout delay))
@@ -300,7 +349,7 @@
                                       :last-txlog-id (-> item :Item :last-txlog-id :S)}
                              root (if-let [addr (:root-address metadata)]
                                     (hh/<? (hhs3/create-tree-from-root-key backend addr))
-                                    (hh/<? (hh/b-tree (hh/->Config 1024 2048 16))))]
+                                    (hh/<? (hh/b-tree (hh/->Config 2048 8 2))))]
                         (swap! state assoc :metadata metadata :root root)))))))
 
   ITxLogWriteBack
@@ -310,7 +359,7 @@
         (let [writer-state (async/<! (aws-async/invoke ddb-client {:op :GetItem
                                                                    :request {:TableName table-name
                                                                              :Key {"topic" {:S "metadata"}
-                                                                                   "id" {:S "writer-state"}}
+                                                                                   "id"    {:S "writer-state"}}
                                                                              :ConsistentRead true}}))]
           (log/debug :task ::write-back! :phase :got-writer-state :writer-state writer-state)
           (cond
@@ -398,8 +447,9 @@
                                                                                                                          ":newToken" {:N (str new-token)}}}}))]
                           (cond
                             (throttle? update-state)
-                            (do (async/<! (async/timeout delay))
-                                (recur 0 phase root metadata new-token partial-results op-chan prev-aws-call (min 60000 (* 2 delay))))
+                            (do
+                              (async/<! (async/timeout delay))
+                              (recur 0 phase root metadata token partial-results op-chan prev-aws-call (min 60000 (* 2 delay))))
 
                             (anomaly? update-state)
                             (throw (ex-info "failed to update writer state" {:error update-state}))
@@ -414,10 +464,10 @@
                               (throw result)
                               (let [aws-call {:op :Scan
                                               :request {:TableName table-name
-                                                        :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}] :ComparisonOperator "EQ"}}
+                                                        :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}]
+                                                                              :ComparisonOperator "EQ"}}
                                                         :ExclusiveStartKey {"topic" {:S "tx-log"}
-                                                                            "id" {:S (or (-> state deref :metadata :last-txlog-id)
-                                                                                         "00--")}}}}]
+                                                                            "id"    {:S (or (:last-txlog-id (:metadata result)) "0")}}}}]
                                 (recur next-timeout :scanning-txlog (:root result) (:metadata result) token []
                                        (aws-async/invoke ddb-client aws-call) aws-call 500)))
 
@@ -434,16 +484,19 @@
 
                               :else
                               (let [messages (->> (:Items result)
-                                                  (map (fn [{:keys [op tx-data tx-date doc-id sub-topic]}]
-                                                         {:op (-> op :S keyword)
-                                                          :tx-data (-> tx-data :B (ByteStreams/toByteArray) nippy/thaw)
-                                                          :tx-date (-> tx-date :S
-                                                                       (ZonedDateTime/parse DateTimeFormatter/ISO_OFFSET_DATE_TIME)
-                                                                       (.toInstant)
-                                                                       (.toEpochMilli)
-                                                                       (Date.))
-                                                          :doc-id (:S doc-id)
-                                                          :sub-topic (some-> (:S sub-topic) keyword)})))
+                                                  (map (fn [{:keys [id tx-data tx-date]}]
+                                                         (let [id (decode-tx-id (:S id))
+                                                               tx-date (-> tx-date :S
+                                                                           (ZonedDateTime/parse DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+                                                                           (.toInstant)
+                                                                           (.toEpochMilli)
+                                                                           (Date.))]
+                                                           {:tx-id   id
+                                                            :tx-date tx-date
+                                                            :tx-data (->> tx-data
+                                                                          :B
+                                                                          (ByteStreams/toByteArray)
+                                                                          (nippy/thaw))}))))
                                     new-partial-results (into partial-results messages)]
                                 (if (and (:LastEvaluatedKey result)
                                          (< (count new-partial-results) 4096))
@@ -454,7 +507,7 @@
                                                             :ExclusiveStartKey (:LastEvaluatedKey result)}}]
                                     (recur next-timeout :scanning-txlog root metadata token new-partial-results
                                            (aws-async/invoke ddb-client aws-call) aws-call 500))
-                                  (recur next-timeout :merging-tree root metadata token (-> result :Items last :id :S)
+                                  (recur next-timeout :merging-tree root metadata token (-> new-partial-results last :tx-id)
                                          (merge-tx-log root new-partial-results) nil 500))))
 
                             :merging-tree
@@ -483,10 +536,10 @@
                                                                 "id" {:S "root"}}
                                                           :UpdateExpression "SET #root = :newRoot, #lastTxid = :lastTxId"
                                                           :ConditionExpression "#root = :curRoot"
-                                                          :ExpressionAttributeNames {"#root" "root-address"
+                                                          :ExpressionAttributeNames {"#root"     "root-address"
                                                                                      "#lastTxid" "last-txlog-id"}
-                                                          :ExpressionAttributeValues {":newRoot" {:S (str (:guid (hh/<? (:storage-addr root))))}
-                                                                                      ":curRoot" {:S (:root-address metadata)}
+                                                          :ExpressionAttributeValues {":newRoot"  {:S (str (:guid (hh/<? (:storage-addr root))))}
+                                                                                      ":curRoot"  {:S (str (:root-address metadata))}
                                                                                       ":lastTxId" {:S partial-results}}}})]
                                 (recur next-timeout :committing-metadata root new-metadata token []
                                        (aws-async/invoke ddb-client aws-call) aws-call 500)))
@@ -494,16 +547,27 @@
                             :committing-metadata
                             (cond
                               (throttle? result)
-                              (do (async/<! (async/timeout delay))
-                                  (recur next-timeout phase root metadata token []
-                                         (aws-async/invoke ddb-client prev-aws-call) prev-aws-call
-                                         (min 60000 (* 2 delay))))
+                              (do
+                                (async/<! (async/timeout delay))
+                                (recur next-timeout phase root metadata token []
+                                       (aws-async/invoke ddb-client prev-aws-call) prev-aws-call
+                                       (min 60000 (* 2 delay))))
 
                               (anomaly? result)
-                              (throw (ex-info "failed to commit tree metadata" {:error result}))
+                              (do
+                                (async/>! (:anchor-chan backend) ::hhs3/abort)
+                                (throw (ex-info "failed to commit tree metadata" {:error result})))
 
                               :else
-                              (swap! state assoc :metadata metadata)))))))))))))))
+                              (do
+                                (async/>! (:anchor-chan backend) ::hhs3/commit)
+                                (let [new-state (swap! state assoc :metadata metadata)]
+                                  (recur next-timeout :cleaning-txlog (:root new-state) (:metadata new-state) token []
+                                         (clean-txlog! this) nil 500))))
+
+                            :cleaning-txlog
+                            (when (instance? Throwable result)
+                              (log/warn result :task ::write-back! :phase :cleaning-txlog)))))))))))))))
 
   consumer/PolledEventLog
   (new-event-log-context [_]
@@ -522,10 +586,15 @@
                              _ (assert (hh/data-node? start-node))
                              elements (-> start-node
                                           :children
-                                          (subseq >= next-offset))]
-                         (recur (hh/<?? (hh/right-successor (pop path)))
-                                (into items (take (- 1024 (count items))
-                                                  (map val elements)))))
+                                          (subseq >= next-offset))
+                             new-items (loop [elements elements
+                                              items items]
+                                         (if (> (count items) 1024)
+                                           items
+                                           (if-let [batch (first elements)]
+                                             (recur (rest elements) (into items (val batch)))
+                                             items)))]
+                         (recur (hh/<?? (hh/right-successor (pop path))) new-items))
                        items))
                    [])
           remaining (when (< (count events) 1024)
@@ -537,7 +606,7 @@
                               result (aws/invoke ddb-client {:op :Scan
                                                              :request {:TableName table-name
                                                                        :ExclusiveStartKey {"topic" {:S "tx-log"}
-                                                                                           "id" {:S txlog-key}}
+                                                                                           "id"    {:S txlog-key}}
                                                                        :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}]
                                                                                              :ComparisonOperator "EQ"}}}})]
                           (log/debug :task ::consumer/next-events :phase :scanned-ddb :result result)
@@ -550,17 +619,21 @@
 
                                 :else
                                 (->> (:Items result)
-                                     (map (fn [{:keys [id tx-date tx-data sub-topic doc-id]}]
-                                            (consumer/->Message (nippy/thaw (ByteStreams/toByteArray (:B tx-data)))
-                                                                nil
-                                                                (decode-tx-id (:S id))
-                                                                (-> (:S tx-date)
-                                                                    (ZonedDateTime/parse DateTimeFormatter/ISO_OFFSET_DATE_TIME)
-                                                                    (.toInstant)
-                                                                    (.toEpochMilli)
-                                                                    (Date.))
-                                                                (:S doc-id)
-                                                                {::tx/sub-topic (some-> (:S sub-topic) keyword)}))))))))]
+                                     (mapcat (fn [{:keys [id tx-date tx-data]}]
+                                               (let [id (decode-tx-id (:S id))
+                                                     tx-date (-> tx-date :S
+                                                                 (ZonedDateTime/parse DateTimeFormatter/ISO_OFFSET_DATE_TIME)
+                                                                 (.toInstant)
+                                                                 (.toEpochMilli)
+                                                                 (Date.))]
+                                                 (->> tx-data :B (ByteStreams/toByteArray) nippy/thaw
+                                                      (map (fn [{:keys [doc-id doc topic]}]
+                                                             (consumer/->Message doc
+                                                                                 nil
+                                                                                 id
+                                                                                 tx-date
+                                                                                 doc-id
+                                                                                 {::tx/sub-topic (some-> topic keyword)}))))))))))))]
       (into events remaining)))
 
   (end-offset [_]
@@ -593,12 +666,12 @@
         (loop [start-key {"topic" {:S "tx-log"}
                           "id" {:S "0"}}
                delay 500]
-          (let [scan-result (async/<! (aws/invoke ddb-client {:op :Scan
-                                                              :request {:TableName table-name
-                                                                        :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}] :ComparisonOperator "EQ"}
-                                                                                     "id" {:AttributeValueList [{:S (encode-tx-id end-txid)}] :ComparisonOperator "LE"}}
-                                                                        :ExclusiveStartKey start-key
-                                                                        :AttributesToGet ["expires" "id"]}}))]
+          (let [scan-result (async/<! (aws-async/invoke ddb-client {:op :Scan
+                                                                    :request {:TableName table-name
+                                                                              :ScanFilter {"topic" {:AttributeValueList [{:S "tx-log"}] :ComparisonOperator "EQ"}
+                                                                                           "id" {:AttributeValueList [{:S (encode-tx-id end-txid)}] :ComparisonOperator "LE"}}
+                                                                              :ExclusiveStartKey start-key
+                                                                              :AttributesToGet ["expires" "id"]}}))]
             (cond (throttle? scan-result)
                   (do (async/<! (async/timeout delay))
                       (recur start-key (min 60000 (* 2 delay))))
@@ -658,9 +731,11 @@
                                                 table-name ::table-name}]
   (log/debug :task ::start-tx-log :phase :begin
              :node-id node-id :bucket bucket :table-name table-name)
-  (let [tx-log (->HitchhikerTreeTxLog (or node-id (str (UUID/randomUUID)))
+  (let [anchor-chan (async/chan)
+        anchor-mult (async/mult anchor-chan)
+        tx-log (->HitchhikerTreeTxLog (or node-id (str (UUID/randomUUID)))
                                       (atom {})
-                                      (hhs3/->S3Backend s3-client bucket object-cache)
+                                      (hhs3/->S3Backend s3-client bucket object-cache anchor-chan anchor-mult)
                                       ddb-client
                                       table-name)]
     (hh/<?? (reload! tx-log))
