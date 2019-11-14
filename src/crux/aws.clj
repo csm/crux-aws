@@ -60,8 +60,8 @@
     return `Triggered tx-log event? ${logAltered}`;
   };"
 
-  (start-aws-node {:crux.tx.hitchhiker-tree/region     "us-west-2"
-                   :crux.tx.hitchhiker-tree/table-name "your-dynamodb-table"
-                   :crux.tx.hitchhiker-tree/bucket     "your-s3-bucket"
-                   :crux.tx.hitchhiker-tree/queue-name "your-sqs-queue"}))
+  (start-hh-node {:crux.tx.hitchhiker-tree/region     "us-west-2"
+                  :crux.tx.hitchhiker-tree/table-name "your-dynamodb-table"
+                  :crux.tx.hitchhiker-tree/bucket     "your-s3-bucket"
+                  :crux.tx.hitchhiker-tree/queue-name "your-sqs-queue"}))
 
