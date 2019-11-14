@@ -13,5 +13,9 @@
                  [com.cognitect.aws/sqs "747.2.533.0"]
                  [com.cognitect.aws/dynamodb "746.2.533.0"]
                  [com.cognitect.aws/streams-dynamodb "747.2.533.0"]
-                 [com.cognitect/anomalies "0.1.12"]]
+                 [com.cognitect/anomalies "0.1.12"]
+                 [io.replikativ/hitchhiker-tree "0.1.5-SNAPSHOT"]
+                 [com.github.csm/konserve-ddb-s3 "0.1.1" :scope "provided"]
+                 [io.replikativ/konserve-leveldb "0.1.2" :scope "provided"]
+                 [org.clojars.mihaelkonjevic/konserve-pg "0.1.2" :scope "provided"]]
   :repl-options {:init-ns crux.aws.repl})

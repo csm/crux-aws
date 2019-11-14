@@ -1,7 +1,6 @@
 (ns crux.aws
-  (:require [crux.tx.s3 :as s3]
-            [crux.tx.hitchhiker-tree :as crux-hh]
-            [crux.node :as n])
+  (:require [crux.node :as n]
+            [crux.tx.hitchhiker-tree :as crux-hh])
   (:import [crux.api ICruxAPI]))
 
 (comment ; todo rewrite for new DI stuff
@@ -14,11 +13,12 @@
 
 (defn start-hh-node
   ^ICruxAPI [config]
-  (let [config (if (nil? (:kv-backend config))
-                 (assoc config :kv-backend "crux.kv.rocksdb.RocksKv")
-                 config)]
-    (n/start
-      (assoc config :crux.node/topology crux-hh/topology))))
+  (n/start
+    (let [topology crux-hh/topology
+          topology (if (= :crux.kv/hitchhiker-tree (::kv-backend config))
+                     (assoc topology ::n/kv-store crux.kv.hitchhiker-tree/kv)
+                     topology)]
+      (assoc (dissoc config ::kv-backend) :crux.node/topology topology))))
 
 (comment
   "You'll want an S3 bucket and DynamoDB table at minimum.

@@ -11,9 +11,7 @@
                         [juxt/crux-jdbc "19.09-1.4.0-alpha"]
                         [io.replikativ/konserve "0.5.1"]
                         [io.replikativ/konserve-leveldb "0.1.2" :exclusions [manifold]]
-                        [s4 "0.1.8"]
-                        [org.clojure/data.csv "0.1.4"]
-                        [itc4j/itc4j-core "0.7.0"]
+                        [s4 "0.1.9"]
                         [org.eclipse.jetty/jetty-server "9.4.15.v20190215"]
                         [com.amazonaws/DynamoDBLocal "1.11.477"
                          :exclusions
@@ -26,9 +24,9 @@
          :source-paths ["scripts" "examples"]
          :jvm-opts ["-Dsqlite4java.library.path=/Users/YOUR_USERNAME_HERE/.m2/repository/com/almworks/sqlite4java/libsqlite4java-osx/1.0.392/"]}}
 
-(import [com.amazonaws.services.dynamodbv2.local.server LocalDynamoDBRequestHandler
-         LocalDynamoDBServerHandler
-         DynamoDBProxyServer])
+(import '[com.amazonaws.services.dynamodbv2.local.server LocalDynamoDBRequestHandler
+          LocalDynamoDBServerHandler
+          DynamoDBProxyServer])
 (require '[clojure.java.io :as io])
 
 (defn start-dynamodb-local
@@ -48,7 +46,6 @@
 
 (require '[s4.core :as s4])
 (require '[konserve-leveldb.core :as kldb])
-(require '[clojure.core.async :as async])
 (require '[konserve.serializers :as ser])
 (require '[superv.async :as sv])
 
@@ -59,8 +56,10 @@
                                                                                                      @s4/write-handlers)))]
     (s4/make-server! {:konserve konserve :enable-sqs? true})))
 
-(.setLevel (org.slf4j.LoggerFactory/getLogger "s4") ch.qos.logback.classic.Level/INFO)
-(.setLevel (org.slf4j.LoggerFactory/getLogger "org.eclipse") ch.qos.logback.classic.Level/INFO)
+(do
+  (.setLevel (org.slf4j.LoggerFactory/getLogger "s4") ch.qos.logback.classic.Level/INFO)
+  (.setLevel (org.slf4j.LoggerFactory/getLogger "org.eclipse") ch.qos.logback.classic.Level/INFO)
+  (.setLevel (org.slf4j.LoggerFactory/getLogger "crux.tx.hitchhiker-tree") ch.qos.logback.classic.Level/DEBUG))
 
 (def ddb (start-dynamodb-local))
 (def s3 (start-s3-local))
@@ -83,17 +82,14 @@
                                                 :hostname "localhost"
                                                 :port (-> @s3 :bind-address (.getPort))}}))
 
-; If you restart and still have your data on disk, skip the following four commands
+(aws/invoke ddb-client {:op :DeleteTable :request {:TableName "crux-aws"}})
+; If you restart and still have your data on disk, skip the following two commands
 (aws/invoke ddb-client {:op :CreateTable
                         :request {:TableName "crux-aws"
-                                  :AttributeDefinitions [{:AttributeName "topic"
-                                                          :AttributeType "S"}
-                                                         {:AttributeName "id"
+                                  :AttributeDefinitions [{:AttributeName "id"
                                                           :AttributeType "S"}]
-                                  :KeySchema [{:AttributeName "topic"
-                                               :KeyType "HASH"}
-                                              {:AttributeName "id"
-                                               :KeyType "RANGE"}]
+                                  :KeySchema [{:AttributeName "id"
+                                               :KeyType "HASH"}]
                                   :ProvisionedThroughput {:ReadCapacityUnits 5
                                                           :WriteCapacityUnits 5}}})
 
@@ -101,11 +97,12 @@
 
 (require 'crux.aws)
 
-(def crux (crux.aws/start-hh-node {:s3-client s3-client
-                                   :ddb-client ddb-client
-                                   :crux.tx.hitchhiker-tree/bucket "crux-aws"
+(def crux (crux.aws/start-hh-node {:crux.tx.hitchhiker-tree/s3-client s3-client
+                                   :crux.tx.hitchhiker-tree/ddb-client ddb-client
+                                   :crux.tx.hitchhiker-tree/bucket-name "crux-aws"
                                    :crux.tx.hitchhiker-tree/table-name "crux-aws"
-                                   :db-dir "data/index"}))
+                                   :crux.tx.hitchhiker-tree/konserve-backend :ddb+s3
+                                   :crux.aws/kv-backend :crux.kv/hitchhiker-tree}))
 
 (require 'crux.api)
 (import 'java.util.UUID)
