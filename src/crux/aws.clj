@@ -29,14 +29,10 @@
   The DynamoDB table should have table spec:
 
     Attribute definitions:
-    topic, type S
     id, type S
 
     Key schema:
-    topic, key type HASH
-    id, key type RANGE
-
-  Also configure TTL on your table on the 'expires' attribute.
+    id, key type HASH
 
   For doing real-time indexing as the tx-log is added to, you can
   also create a DynamoDB stream that publishes to a lambda, which
