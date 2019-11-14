@@ -1,5 +1,6 @@
 (ns crux.aws
   (:require [crux.node :as n]
+            crux.kv.hitchhiker-tree
             [crux.tx.hitchhiker-tree :as crux-hh])
   (:import [crux.api ICruxAPI]))
 
