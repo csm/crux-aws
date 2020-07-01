@@ -4,7 +4,25 @@
 
 Experimental.
 
-[Quick start](https://github.com/csm/crux-aws/blob/master/examples/local-test.clj).
+## Quick Start:
 
-Primarily an investigation on using crux as a data store
-atop a very cheap storage solution. It may not work at all.
+For a full AWS experience:
+
+```clojure
+(def node (crux.api/start-node {:crux.node/topology crux.aws/topology
+                                :crux.dynamodb/table-name "your-dynamodb-tx-table"
+                                :crux.s3/bucket "your-s3-doc-bucket"
+                                :crux.kv.hitchhiker-tree/konserve crux.kv.hitchhiker-tree.konserve.ddb-s3/ddb-s3-backend
+                                :crux.kv.hitchhiker-tree.konserve.ddb-s3/bucket "your-dynamodb-kv-table"
+                                :crux.kv.hitchhiker-tree.konserve.ddb-s3/table "your-s3-kv-bucket"
+                                :crux.kv.hitchhiker-tree.konserve.ddb-s3/region "us-west-2"}))
+```
+
+## TODO
+
+The KV store needs to handle concurrent writes better than it does.
+
+The KV store should take updates from the remote store periodically (or on changes
+to dynamodb) so it keeps in sync.
+
+The transaction log could wait for changes triggered
