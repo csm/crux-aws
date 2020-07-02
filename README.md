@@ -18,6 +18,9 @@ For a full AWS experience:
                                 :crux.kv.hitchhiker-tree.konserve.ddb-s3/region "us-west-2"}))
 ```
 
+**NOTE** the hitchhiker-tree KV store with the konserve-ddb-s3 backend is
+currently broken; use a different KV store for now.
+
 ## TODO
 
 The KV store needs to handle concurrent writes better than it does.

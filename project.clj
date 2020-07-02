@@ -10,7 +10,8 @@
                  [juxt/crux-s3 "20.06-1.9.1-beta" :exclusions [software.amazon.awssdk/s3]]
                  [com.github.csm/crux-dynamodb "0.1.1"]
                  [com.github.csm/konserve-ddb-s3 "0.1.4"]
-                 [com.github.csm/crux-hitchhiker-tree "0.1.0"]
+                 [com.github.csm/crux-hitchhiker-tree "0.1.1"]
+                 [com.github.csm/crux-ddb-s3 "0.1.0"]
                  [ch.qos.logback/logback-classic "1.2.3"]
                  [ch.qos.logback/logback-core "1.2.3"]]
   :repl-options {:init-ns crux.aws.repl}
