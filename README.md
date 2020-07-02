@@ -21,6 +21,13 @@ For a full AWS experience:
 **NOTE** the hitchhiker-tree KV store with the konserve-ddb-s3 backend is
 currently broken; use a different KV store for now.
 
+Subprojects you should look at as well:
+
+* [crux-dynamodb](https://github.com/csm/crux-dynamodb) -- TxLog on DynamoDB.
+* [crux-ddb-s3](https://github.com/csm/crux-ddb-s3) -- TxLog spread between DynamoDB and S3.
+* [crux-hitchhiker-tree](https://github.com/csm/crux-kv-hitchhiker-tree) -- KV store on hitchhiker-tree.
+
+
 ## TODO
 
 The KV store needs to handle concurrent writes better than it does.
